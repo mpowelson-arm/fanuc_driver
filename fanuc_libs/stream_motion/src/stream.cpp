@@ -28,6 +28,12 @@ constexpr uint16_t kCommandPacketUnused = 0xFFFF;
 constexpr int kThresholdPayloadLength = 20;
 constexpr size_t kR50ControllerCapabilityResponseSize = 25;
 
+bool ShouldLogDiscard(uint32_t& discard_count)
+{
+  ++discard_count;
+  return discard_count <= 3 || (discard_count % 50) == 0;
+}
+
 std::string FormatByteString(const void* data, const size_t size, const size_t max_bytes = 32)
 {
   const auto* bytes = static_cast<const uint8_t*>(data);
@@ -149,6 +155,7 @@ struct StreamMotionConnection::PSocketImpl
   {
     value = T();
     const auto start_time = std::chrono::steady_clock::now();
+    uint32_t discard_count = 0;
     while (true)
     {
       constexpr size_t kPacketNumBytes = sizeof(T);
@@ -161,11 +168,13 @@ struct StreamMotionConnection::PSocketImpl
       }
       if (has_value && received_size > 0)
       {
-        std::cerr << "Received unexpected UDP packet size. Expected " << kPacketNumBytes << " bytes, got "
-                  << received_size << " bytes from " << server_address
-                  << ". Raw bytes: " << FormatByteString(&value, received_size)
-                  << std::endl;
-        return false;
+        if (ShouldLogDiscard(discard_count))
+        {
+          std::cerr << "Discarding unexpected UDP packet while waiting for " << kPacketNumBytes
+                    << "-byte response. got=" << received_size << " from " << server_address
+                    << " raw=" << FormatByteString(&value, received_size) << std::endl;
+        }
+        continue;
       }
       if (std::chrono::steady_clock::now() - start_time > std::chrono::duration<double>(timeout))
       {
@@ -180,8 +189,9 @@ struct StreamMotionConnection::PSocketImpl
   bool receiveControllerCapability(ControllerCapabilityResultPacket& controller_capability)
   {
     controller_capability = ControllerCapabilityResultPacket{};
-    std::array<uint8_t, sizeof(ControllerCapabilityResultPacket)> raw_bytes{};
+    std::array<uint8_t, 512> raw_bytes{};
     const auto start_time = std::chrono::steady_clock::now();
+    uint32_t discard_count = 0;
     while (true)
     {
       sockpp::result<size_t> res = sock.recv(raw_bytes.data(), raw_bytes.size());
@@ -193,6 +203,21 @@ struct StreamMotionConnection::PSocketImpl
         if (received_size == kR50ControllerCapabilityResponseSize)
         {
           controller_capability.rob_status_use_tcp = raw_bytes[24];
+        }
+        ControllerCapabilityResultPacket swapped = controller_capability;
+        swapControllerCapabilityResponseBytes(swapped);
+        if (swapped.packet_type != kGetCapabilityPacketType)
+        {
+          if (ShouldLogDiscard(discard_count))
+          {
+            std::cerr << "Discarding unexpected packet while waiting for controller capability. size="
+                      << received_size << " packet_type=" << swapped.packet_type
+                      << " raw=" << FormatByteString(raw_bytes.data(), received_size) << std::endl;
+          }
+          continue;
+        }
+        if (received_size == kR50ControllerCapabilityResponseSize)
+        {
           std::cerr << "Received 25-byte controller capability response from " << server_address
                     << ". Accepting it using R-50 compatibility parsing. Raw bytes: "
                     << FormatByteString(raw_bytes.data(), received_size) << std::endl;
@@ -201,11 +226,14 @@ struct StreamMotionConnection::PSocketImpl
       }
       if (has_value && received_size > 0)
       {
-        std::cerr << "Received unexpected controller capability size. Expected "
-                  << sizeof(ControllerCapabilityResultPacket) << " or " << kR50ControllerCapabilityResponseSize
-                  << " bytes, got " << received_size << " bytes from " << server_address
-                  << ". Raw bytes: " << FormatByteString(raw_bytes.data(), received_size) << std::endl;
-        return false;
+        if (ShouldLogDiscard(discard_count))
+        {
+          std::cerr << "Discarding unexpected UDP packet while waiting for controller capability. Expected "
+                    << sizeof(ControllerCapabilityResultPacket) << " or " << kR50ControllerCapabilityResponseSize
+                    << " bytes, got " << received_size << " bytes from " << server_address
+                    << ". Raw bytes: " << FormatByteString(raw_bytes.data(), received_size) << std::endl;
+        }
+        continue;
       }
       if (std::chrono::steady_clock::now() - start_time > std::chrono::duration<double>(timeout))
       {
@@ -333,10 +361,20 @@ bool StreamMotionConnection::getControllerCapability(ControllerCapabilityResultP
 void StreamMotionConnection::sendStartPacket() const
 {
   std::cout << "[StreamMotion] Sending StartPacket with version_no=" << version_no_ << std::endl;
-  StartPacket start_packet{};
-  start_packet.packet_type = swapBytesIfNeeded(start_packet.packet_type);
-  start_packet.version_no = swapBytesIfNeeded(version_no_);
-  socket_impl_->send(start_packet);
+  if (version_no_ <= 2)
+  {
+    LegacyStartPacket start_packet{};
+    start_packet.packet_type = swapBytesIfNeeded(start_packet.packet_type);
+    start_packet.version_no = swapBytesIfNeeded(version_no_);
+    socket_impl_->send(start_packet);
+  }
+  else
+  {
+    StartPacket start_packet{};
+    start_packet.packet_type = swapBytesIfNeeded(start_packet.packet_type);
+    start_packet.version_no = swapBytesIfNeeded(version_no_);
+    socket_impl_->send(start_packet);
+  }
 }
 
 void StreamMotionConnection::sendStopPacket() const
@@ -376,6 +414,23 @@ void swapCommandPacketBytes(CommandPacket& command)
   // Skip io_command since this is always expected to be little endian.
 }
 
+void swapLegacyCommandPacketBytes(LegacyCommandPacket& command)
+{
+  command.packet_type = swapBytesIfNeeded(command.packet_type);
+  command.version_no = swapBytesIfNeeded(command.version_no);
+  command.sequence_no = swapBytesIfNeeded(command.sequence_no);
+  command.io_read_index = swapBytesIfNeeded(command.io_read_index);
+  command.io_read_mask = swapBytesIfNeeded(command.io_read_mask);
+  command.io_write_index = swapBytesIfNeeded(command.io_write_index);
+  command.io_write_mask = swapBytesIfNeeded(command.io_write_mask);
+  command.io_write_value = swapBytesIfNeeded(command.io_write_value);
+  command.unused = swapBytesIfNeeded(command.unused);
+  for (float& pos : command.command_pos)
+  {
+    pos = swapBytesIfNeeded(pos);
+  }
+}
+
 void swapRobotStatusPacketBytes(RobotStatusPacket& status)
 {
   status.packet_type = swapBytesIfNeeded(status.packet_type);
@@ -397,6 +452,23 @@ void swapRobotStatusPacketBytes(RobotStatusPacket& status)
   status.moment_z = swapBytesIfNeeded(status.moment_z);
   status.fs_type = swapBytesIfNeeded(status.fs_type);
   // Skip io_status since this is always expected to be little endian.
+}
+
+void swapLegacyRobotStatusPacketBytes(LegacyRobotStatusPacket& status)
+{
+  status.packet_type = swapBytesIfNeeded(status.packet_type);
+  status.version_no = swapBytesIfNeeded(status.version_no);
+  status.sequence_no = swapBytesIfNeeded(status.sequence_no);
+  status.io_read_index = swapBytesIfNeeded(status.io_read_index);
+  status.io_read_mask = swapBytesIfNeeded(status.io_read_mask);
+  status.io_read_value = swapBytesIfNeeded(status.io_read_value);
+  status.time_stamp = swapBytesIfNeeded(status.time_stamp);
+  for (int idx = 0; idx < kMaxAxisNumber; idx++)
+  {
+    status.joint_angle[idx] = swapBytesIfNeeded(status.joint_angle[idx]);
+    status.position[idx] = swapBytesIfNeeded(status.position[idx]);
+    status.current[idx] = swapBytesIfNeeded(status.current[idx]);
+  }
 }
 
 void swapRobotThresholdPacketBytes(RobotThresholdPacket& threshold_packet)
@@ -453,22 +525,87 @@ void swapControllerCapabilityResponseBytes(ControllerCapabilityResultPacket& con
       swapBytesIfNeeded(controller_capability_result_packet.rob_status_use_tcp);
 }
 
+void swapCommandPositionResponseBytes(CommandPositionResponsePacket& command_position_response)
+{
+  command_position_response.packet_type = swapBytesIfNeeded(command_position_response.packet_type);
+  command_position_response.version_no = swapBytesIfNeeded(command_position_response.version_no);
+  command_position_response.time_stamp = swapBytesIfNeeded(command_position_response.time_stamp);
+  for (int idx = 0; idx < kMaxAxisNumber; ++idx)
+  {
+    command_position_response.position[idx] = swapBytesIfNeeded(command_position_response.position[idx]);
+    command_position_response.joint_angle[idx] = swapBytesIfNeeded(command_position_response.joint_angle[idx]);
+  }
+}
+
+bool StreamMotionConnection::getCommandPosition(std::array<double, kMaxAxisNumber>& command_pos) const
+{
+  CommandPositionRequestPacket request{};
+  request.packet_type = swapBytesIfNeeded(request.packet_type);
+  request.version_no = swapBytesIfNeeded(request.version_no);
+  socket_impl_->send(request);
+
+  CommandPositionResponsePacket response{};
+  if (!socket_impl_->receive(response))
+  {
+    std::cerr << "Failed to receive command-position response." << std::endl;
+    return false;
+  }
+
+  swapCommandPositionResponseBytes(response);
+  if (response.packet_type != kCommandPositionPacketType)
+  {
+    std::cerr << "Unexpected command-position packet type: " << response.packet_type
+              << " (expected " << kCommandPositionPacketType << ")." << std::endl;
+    return false;
+  }
+
+  for (size_t i = 0; i < command_pos.size(); ++i)
+  {
+    command_pos[i] = static_cast<double>(response.joint_angle[i]);
+  }
+  return true;
+}
+
 void StreamMotionConnection::sendCommand(const std::array<double, kMaxAxisNumber>& command_pos,
                                          const bool is_last_command, const std::array<uint8_t, 256>& io_command) const
 {
   if (command_sequence_no_ % 100 == 0 || is_last_command) {
     std::cout << "[StreamMotion] Sending CommandPacket seq=" << command_sequence_no_ << " is_last=" << is_last_command << std::endl;
   }
-  CommandPacket command{};
-  command.version_no = version_no_;
-  command.command_pos = command_pos;
-  command.sequence_no = command_sequence_no_;
-  command.is_last_command = is_last_command;
-  command.do_motn_ctrl = 1;
-  command.unused = kCommandPacketUnused;
-  command.io_command = io_command;
-  swapCommandPacketBytes(command);
-  socket_impl_->send(command);
+  if (version_no_ <= 2)
+  {
+    LegacyCommandPacket command{};
+    command.version_no = version_no_;
+    command.sequence_no = command_sequence_no_;
+    command.is_last_command = is_last_command;
+    command.io_read_type = 0;
+    command.io_read_index = 0;
+    command.io_read_mask = 0;
+    command.io_write_type = 0;
+    command.io_write_index = 0;
+    command.io_write_mask = 0;
+    command.io_write_value = 0;
+    command.unused = 0;
+    for (size_t i = 0; i < command.command_pos.size(); ++i)
+    {
+      command.command_pos[i] = static_cast<float>(command_pos[i]);
+    }
+    swapLegacyCommandPacketBytes(command);
+    socket_impl_->send(command);
+  }
+  else
+  {
+    CommandPacket command{};
+    command.version_no = version_no_;
+    command.command_pos = command_pos;
+    command.sequence_no = command_sequence_no_;
+    command.is_last_command = is_last_command;
+    command.do_motn_ctrl = 1;
+    command.unused = kCommandPacketUnused;
+    command.io_command = io_command;
+    swapCommandPacketBytes(command);
+    socket_impl_->send(command);
+  }
 }
 
 bool StreamMotionConnection::getStatusPacket(RobotStatusPacket& status)
@@ -485,7 +622,36 @@ bool StreamMotionConnection::getStatusPacket(RobotStatusPacket& status)
 
     // Check version_no_ and create dummy status packet if needed to keep backward compatibility
     // ROS 2 will always use the newest status packet RobotStatusPacket
-    if (version_no_ <= 3)
+    if (version_no_ <= 2)
+    {
+      LegacyRobotStatusPacket legacy_status{};
+      received = socket_impl_->receive(legacy_status);
+      if (received)
+      {
+        swapLegacyRobotStatusPacketBytes(legacy_status);
+        status.packet_type = legacy_status.packet_type;
+        status.version_no = legacy_status.version_no;
+        status.sequence_no = legacy_status.sequence_no;
+        status.status = legacy_status.status;
+        status.robot_status = 0;
+        status.contact_stop_status = ContactStopStatus::None;
+        status.unused = 0;
+        status.time_stamp = legacy_status.time_stamp;
+        status.position = legacy_status.position;
+        status.joint_angle = legacy_status.joint_angle;
+        status.current = legacy_status.current;
+        status.safety_scale = 0.0;
+        status.force_x = 0.0;
+        status.force_y = 0.0;
+        status.force_z = 0.0;
+        status.moment_x = 0.0;
+        status.moment_y = 0.0;
+        status.moment_z = 0.0;
+        status.fs_type = 0;
+        status.io_status.fill(0);
+      }
+    }
+    else if (version_no_ <= 3)
     {
       V3RobotStatusPacket dummy_status{};
       received = socket_impl_->receive(dummy_status);
@@ -523,8 +689,11 @@ bool StreamMotionConnection::getStatusPacket(RobotStatusPacket& status)
 
     status_sequence_no_++;
 
-    // Swap the bits of the received status packet
-    swapRobotStatusPacketBytes(status);
+    if (version_no_ > 2)
+    {
+      // Swap the bits of the received status packet
+      swapRobotStatusPacketBytes(status);
+    }
 
     static uint32_t last_status_bits = 0;
     static uint32_t last_robot_status_bits = 0;

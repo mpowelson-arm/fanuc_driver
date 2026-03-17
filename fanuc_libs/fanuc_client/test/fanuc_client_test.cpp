@@ -79,6 +79,16 @@ public:
   bool getControllerCapability(stream_motion::ControllerCapabilityResultPacket& controller_capability) override
   {
     controller_capability.sampling_rate = 8;
+    controller_capability.available_version = 2;
+    return true;
+  }
+
+  bool getCommandPosition(std::array<double, stream_motion::kMaxAxisNumber>& command_pos) const override
+  {
+    for (size_t i = 0; i < command_pos.size(); ++i)
+    {
+      command_pos[i] = static_cast<double>(status_.joint_angle[i]);
+    }
     return true;
   }
 

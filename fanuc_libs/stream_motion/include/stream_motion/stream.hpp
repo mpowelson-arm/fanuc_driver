@@ -64,6 +64,8 @@ public:
 
   virtual bool getControllerCapability(ControllerCapabilityResultPacket& controller_capability) = 0;
 
+  virtual bool getCommandPosition(std::array<double, kMaxAxisNumber>& command_pos) const = 0;
+
   /**
    * @brief Configures force sensor.
    */
@@ -98,6 +100,8 @@ public:
   bool configureGPIO(const GPIOConfiguration& config) const override;
 
   bool getControllerCapability(ControllerCapabilityResultPacket& controller_capability) override;
+
+  bool getCommandPosition(std::array<double, kMaxAxisNumber>& command_pos) const override;
 
   void configureForceSensor(uint32_t do_reset, uint32_t force_sensor_type) const override;
 

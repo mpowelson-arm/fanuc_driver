@@ -11,6 +11,9 @@
 namespace stream_motion
 {
 constexpr uint32_t kVersion = 3;  // base version for client
+constexpr uint32_t kLegacyStartPacketType = 0;
+constexpr uint32_t kLegacyCommandPacketType = 1;
+constexpr uint32_t kCommandPositionPacketType = 4;
 constexpr uint32_t kStopPacketType = 2;
 constexpr uint32_t kThresholdPacketType = 3;
 constexpr uint32_t kGetCapabilityPacketType = 7;
@@ -66,6 +69,12 @@ struct StartPacket
   uint32_t version_no = kVersion;
 };
 
+struct LegacyStartPacket
+{
+  uint32_t packet_type = kLegacyStartPacketType;
+  uint32_t version_no = kVersion;
+};
+
 enum class ContactStopStatus : uint8_t
 {
   None = 0,
@@ -102,6 +111,22 @@ struct RobotStatusPacket  // Newest status packet structure
 };
 
 // Old robot status packet structures to keep backward compatibility
+struct LegacyRobotStatusPacket  // V1/V2 legacy status packet
+{
+  uint32_t packet_type{};
+  uint32_t version_no{};
+  uint32_t sequence_no{};
+  uint8_t status{};
+  uint8_t io_read_type{};
+  uint16_t io_read_index{};
+  uint16_t io_read_mask{};
+  uint16_t io_read_value{};
+  uint32_t time_stamp{};
+  std::array<float, kMaxAxisNumber> position{};
+  std::array<float, kMaxAxisNumber> joint_angle{};
+  std::array<float, kMaxAxisNumber> current{};
+};
+
 struct V3RobotStatusPacket  // V3: no force data
 {
   uint32_t packet_type{};  // 202
@@ -132,6 +157,39 @@ struct CommandPacket
   // Note: io_command expects values in little endian. When packing this array, least-significant bytes comes first.
   std::array<uint8_t, 256> io_command{};
   // could be either cartesian position or joint angle, based on dataStyle
+};
+
+struct LegacyCommandPacket
+{
+  uint32_t packet_type = kLegacyCommandPacketType;
+  uint32_t version_no = kVersion;
+  uint32_t sequence_no{};
+  uint8_t is_last_command{};
+  uint8_t io_read_type{};
+  uint16_t io_read_index{};
+  uint16_t io_read_mask{};
+  uint8_t data_format{ 1 };  // joint
+  uint8_t io_write_type{};
+  uint16_t io_write_index{};
+  uint16_t io_write_mask{};
+  uint16_t io_write_value{};
+  uint16_t unused{};
+  std::array<float, kMaxAxisNumber> command_pos{};
+};
+
+struct CommandPositionRequestPacket
+{
+  uint32_t packet_type = kCommandPositionPacketType;
+  uint32_t version_no = 1;
+};
+
+struct CommandPositionResponsePacket
+{
+  uint32_t packet_type{};
+  uint32_t version_no{};
+  uint32_t time_stamp{};
+  std::array<float, kMaxAxisNumber> position{};
+  std::array<float, kMaxAxisNumber> joint_angle{};
 };
 
 // Table 3.3(d) : Status output stop packet (External Device → Robot)

@@ -491,6 +491,19 @@ void FanucClient::startRealtimeStream(std::shared_ptr<GPIOBuffer> gpio_buffer)
   stream_motion::RobotStatusPacket status;
   stream_motion_->sendStartPacket();
   std::cout << "Sent Stream Motion start packet." << std::endl;
+  std::array<double, stream_motion::kMaxAxisNumber> initial_command{};
+  const bool got_initial_command = stream_motion_->getCommandPosition(initial_command);
+  if (got_initial_command)
+  {
+    std::cout << "Seeded initial Stream Motion command from command-position response. J1=" << initial_command[0]
+              << " J2=" << initial_command[1] << " J3=" << initial_command[2] << " J4=" << initial_command[3]
+              << " J5=" << initial_command[4] << " J6=" << initial_command[5] << " J7=" << initial_command[6]
+              << std::endl;
+  }
+  else
+  {
+    std::cerr << "Failed to read initial command position before waiting for stream readiness." << std::endl;
+  }
   stream_motion_->configureForceSensor(0, force_sensor_type_);
   std::cout << "Configured force sensor. force_sensor_type=" << force_sensor_type_ << std::endl;
   const auto pre_loop_time = std::chrono::steady_clock::now();
@@ -566,8 +579,9 @@ void FanucClient::startRealtimeStream(std::shared_ptr<GPIOBuffer> gpio_buffer)
   last_joint_angles_ = Eigen::VectorXd::Zero(status.joint_angle.size());
   for (Eigen::Index i = 0; i < status.joint_angle.size(); ++i)
   {
-    last_joint_angles_[i] = static_cast<double>(status.joint_angle[i]);
-    command_pos[i] = static_cast<double>(status.joint_angle[i]);
+    const double status_joint = static_cast<double>(status.joint_angle[i]);
+    last_joint_angles_[i] = status_joint;
+    command_pos[i] = got_initial_command ? initial_command[i] : status_joint;
   }
   stream_motion_->sendCommand(command_pos, false, {});
 
