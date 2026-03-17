@@ -332,6 +332,7 @@ bool StreamMotionConnection::getControllerCapability(ControllerCapabilityResultP
 
 void StreamMotionConnection::sendStartPacket() const
 {
+  std::cout << "[StreamMotion] Sending StartPacket with version_no=" << version_no_ << std::endl;
   StartPacket start_packet{};
   start_packet.packet_type = swapBytesIfNeeded(start_packet.packet_type);
   start_packet.version_no = swapBytesIfNeeded(version_no_);
@@ -340,6 +341,7 @@ void StreamMotionConnection::sendStartPacket() const
 
 void StreamMotionConnection::sendStopPacket() const
 {
+  std::cout << "[StreamMotion] Sending StopPacket with version_no=" << version_no_ << std::endl;
   StopPacket stop_packet{};
   stop_packet.packet_type = swapBytesIfNeeded(stop_packet.packet_type);
   stop_packet.version_no = swapBytesIfNeeded(version_no_);
@@ -454,6 +456,9 @@ void swapControllerCapabilityResponseBytes(ControllerCapabilityResultPacket& con
 void StreamMotionConnection::sendCommand(const std::array<double, kMaxAxisNumber>& command_pos,
                                          const bool is_last_command, const std::array<uint8_t, 256>& io_command) const
 {
+  if (command_sequence_no_ % 100 == 0 || is_last_command) {
+    std::cout << "[StreamMotion] Sending CommandPacket seq=" << command_sequence_no_ << " is_last=" << is_last_command << std::endl;
+  }
   CommandPacket command{};
   command.version_no = version_no_;
   command.command_pos = command_pos;
@@ -468,6 +473,11 @@ void StreamMotionConnection::sendCommand(const std::array<double, kMaxAxisNumber
 
 bool StreamMotionConnection::getStatusPacket(RobotStatusPacket& status)
 {
+  static auto last_status_time = std::chrono::steady_clock::now();
+  auto now = std::chrono::steady_clock::now();
+  double dt = std::chrono::duration<double>(now - last_status_time).count();
+  last_status_time = now;
+
   if (command_sequence_no_ == status_sequence_no_)
   {
     status = RobotStatusPacket{};
@@ -515,9 +525,29 @@ bool StreamMotionConnection::getStatusPacket(RobotStatusPacket& status)
 
     // Swap the bits of the received status packet
     swapRobotStatusPacketBytes(status);
-    std::cout << "Received status packet: packet_type=" << status.packet_type << " version_no=" << status.version_no
-              << " sequence_no=" << status.sequence_no << " status=0x" << std::hex << static_cast<int>(status.status)
-              << " robot_status=0x" << static_cast<int>(status.robot_status) << std::dec << std::endl;
+
+    static uint32_t last_status_bits = 0;
+    static uint32_t last_robot_status_bits = 0;
+    
+    bool status_changed = (status.status != last_status_bits) || (status.robot_status != last_robot_status_bits);
+    
+    if (status_changed || status_sequence_no_ % 100 == 0) {
+      bool waiting = (status.status & 0x01) != 0;
+      bool cmd_received = (status.status & 0x02) != 0;
+      bool sysrdy = (status.status & 0x04) != 0;
+      bool moving = (status.status & 0x08) != 0;
+
+      std::cout << "[StreamMotion] Status " << (status_changed ? "CHANGED" : "UPDATE") 
+                << ": seq=" << status.sequence_no 
+                << " dt=" << dt << "s"
+                << " waiting=" << waiting << " cmd_received=" << cmd_received
+                << " sysrdy=" << sysrdy << " moving=" << moving 
+                << " status=0x" << std::hex << static_cast<int>(status.status)
+                << " robot_status=0x" << static_cast<int>(status.robot_status) << std::dec << std::endl;
+                
+      last_status_bits = status.status;
+      last_robot_status_bits = status.robot_status;
+    }
 
     if (status_sequence_no_ != status.sequence_no)
     {

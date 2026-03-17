@@ -4,7 +4,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 add_executable(stream_motion_example stream_motion_example.cpp)
-target_link_libraries(stream_motion_example PRIVATE stream_motion)
+target_link_libraries(stream_motion_example PRIVATE stream_motion rmi)
 
 add_executable(manual_stream_motion_probe manual_stream_motion_probe.cpp)
 target_link_libraries(manual_stream_motion_probe PRIVATE rmi Sockpp::sockpp)

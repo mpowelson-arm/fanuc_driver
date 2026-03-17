@@ -81,11 +81,27 @@ Root cause:
 
 ## Open Compatibility Issues
 
-### 4. Stream Motion startup still fails on the tested R-50 controller
+### 4. Stream Motion Protocol Version and Session Constraints
 
 Observed behavior:
+- The driver and probe runs showed protocol/session mismatches if the version requested in the start packet does not match the command packet format.
+- Specifically, sending a version-1 start packet but a version-2 command packet causes the controller to reject the session.
 
-- The controller reports and/or visibly shows that `STREAM_MOTN` is running.
+### 5. Motion-Limit Alarms vs Cadence Alarms
+
+Observed behavior:
+- We have seen motion-profile rejection alarms like `MOTN-609` (jerk/velocity limit alarms). This indicates the controller is successfully receiving and evaluating command packets.
+- We have also seen stream lifecycle/cadence failures like `MOTN-603`, `CPMO-023`, and the `waiting` bit dropping early.
+- The manual explicitly states that limits are computed using the communication interval as fixed time (usually 8 ms). This affects all trajectory assumptions.
+
+### 6. Stream Setup Works, but Sustainment is Fragile
+
+Observed behavior:
+- The strongest positive signal was brief jerking/shaking as brakes released and re-engaged, plus the controller progressing far enough to evaluate command packets and raise motion-profile alarms.
+- This proves that stream setup works and the path is not dead. However, stream sustainment is fragile and we should not treat any prior run as a successful motion execution.
+- The manual requires one command packet per communication cycle after `waiting` goes high, and says command packets should be sent immediately after each received status packet. Ending status communication before command communication ends can cause alarms.
+
+### 7. Stream Motion startup still fails on the tested R-50 controller
 - RMI connectivity is healthy.
 - Stream Motion capability query succeeds.
 - Stream Motion robot limit queries succeed.

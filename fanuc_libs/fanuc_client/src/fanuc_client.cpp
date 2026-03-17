@@ -487,38 +487,17 @@ void FanucClient::startRealtimeStream(std::shared_ptr<GPIOBuffer> gpio_buffer)
   std::cout << "Requested RMI program call for STREAM_MOTN with sequence_id=" << stream_motn_request.SequenceID
             << std::endl;
 
-  std::array<double, stream_motion::kMaxAxisNumber> initial_command{};
-  try
-  {
-    const Eigen::Ref<const Eigen::VectorXd> current_joint_angles = readJointAnglesRMI();
-    for (Eigen::Index i = 0; i < current_joint_angles.size(); ++i)
-    {
-      initial_command[i] = current_joint_angles[i];
-    }
-    std::cout << "Seeded initial Stream Motion command from RMI joint angles. J1=" << initial_command[0]
-              << " J2=" << initial_command[1] << " J3=" << initial_command[2] << " J4=" << initial_command[3]
-              << " J5=" << initial_command[4] << " J6=" << initial_command[5] << std::endl;
-  }
-  catch (const std::exception& e)
-  {
-    std::cerr << "Failed to read initial joint angles from RMI before starting stream: " << e.what() << std::endl;
-  }
-
   // Wait for the stream connection to be ready
   stream_motion::RobotStatusPacket status;
   stream_motion_->sendStartPacket();
   std::cout << "Sent Stream Motion start packet." << std::endl;
-  stream_motion_->sendCommand(initial_command, false, {});
-  std::cout << "Sent initial hold-position command to seed Stream Motion buffer." << std::endl;
   stream_motion_->configureForceSensor(0, force_sensor_type_);
   std::cout << "Configured force sensor. force_sensor_type=" << force_sensor_type_ << std::endl;
   const auto pre_loop_time = std::chrono::steady_clock::now();
   auto last_start_packet_time = pre_loop_time;
-  auto last_seed_command_time = pre_loop_time;
   auto last_rmi_status_poll_time = pre_loop_time;
   bool got_status = false;
   int start_packet_attempts = 1;
-  int seed_command_attempts = 1;
   while (true)
   {
     if (stream_motion_->getStatusPacket(status))
@@ -538,15 +517,6 @@ void FanucClient::startRealtimeStream(std::shared_ptr<GPIOBuffer> gpio_buffer)
       ++start_packet_attempts;
       last_start_packet_time = now;
       std::cout << "Resent Stream Motion start packet. attempt=" << start_packet_attempts << std::endl;
-    }
-
-    if (!got_status && now - last_seed_command_time >= kStartPacketRetryInterval)
-    {
-      stream_motion_->sendCommand(initial_command, false, {});
-      ++seed_command_attempts;
-      last_seed_command_time = now;
-      std::cout << "Resent initial hold-position command to seed Stream Motion buffer. attempt="
-                << seed_command_attempts << std::endl;
     }
 
     if (now - last_rmi_status_poll_time >= kRMIStatusPollInterval)
@@ -579,15 +549,13 @@ void FanucClient::startRealtimeStream(std::shared_ptr<GPIOBuffer> gpio_buffer)
         std::cerr << "Timed out waiting for STREAM_MOTN ready bit. Last status packet: sequence_no="
                   << status.sequence_no << " status=0x" << std::hex << static_cast<int>(status.status)
                   << " robot_status=0x" << static_cast<int>(status.robot_status) << std::dec
-                  << " start_packet_attempts=" << start_packet_attempts
-                  << " seed_command_attempts=" << seed_command_attempts << std::endl;
+                  << " start_packet_attempts=" << start_packet_attempts << std::endl;
         throw std::runtime_error(kStatusStatusNotReadyMessage);
       }
       else
       {
         std::cerr << "Timed out waiting for any Stream Motion status packet after launching STREAM_MOTN."
-                  << " start_packet_attempts=" << start_packet_attempts
-                  << " seed_command_attempts=" << seed_command_attempts << std::endl;
+                  << " start_packet_attempts=" << start_packet_attempts << std::endl;
         throw std::runtime_error(kStatusPacketFailureMessage);
       }
     }
@@ -618,28 +586,31 @@ void FanucClient::stopRealtimeStream()
     rt_thread_.join();
   }
 
-  // Wait for robot to stop motion
+  std::cout << "Sending final Stream Motion command with last_data=1 before shutdown." << std::endl;
+  stream_motion_->sendCommand(command_pos, true, {});
+
+  // Give the controller one more status cycle to acknowledge the final command.
   stream_motion::RobotStatusPacket status;
-  const auto motion_pre_loop_time = std::chrono::steady_clock::now();
-  do
+  bool got_status_after_last_command = false;
+  const auto settle_pre_loop_time = std::chrono::steady_clock::now();
+  while (std::chrono::steady_clock::now() - settle_pre_loop_time <= std::chrono::seconds(1))
   {
-    if (std::chrono::steady_clock::now() - motion_pre_loop_time > std::chrono::seconds(1))
+    if (stream_motion_->getStatusPacket(status))
     {
+      got_status_after_last_command = true;
+      std::cout << "Status after last_data=1: sequence_no=" << status.sequence_no
+                << " status=0x" << std::hex << static_cast<int>(status.status)
+                << " robot_status=0x" << static_cast<int>(status.robot_status) << std::dec << std::endl;
       break;
     }
+  }
+  if (!got_status_after_last_command)
+  {
+    throw std::runtime_error(kStatusPacketFailureMessage);
+  }
 
-    const auto status_pre_loop_time = std::chrono::steady_clock::now();
-    while (!stream_motion_->getStatusPacket(status))
-    {
-      if (std::chrono::steady_clock::now() - status_pre_loop_time > std::chrono::seconds(1))
-      {
-        throw std::runtime_error(kStatusPacketFailureMessage);
-      }
-    }
-  } while (status.status & 0x8);
-
-  rmi_connection_->abort(std::nullopt);
   stream_motion_->sendStopPacket();
+  rmi_connection_->abort(std::nullopt);
 }
 
 bool FanucClient::isStreaming()
