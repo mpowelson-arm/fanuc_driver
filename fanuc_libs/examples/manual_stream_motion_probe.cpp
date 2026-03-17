@@ -1,6 +1,7 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <iomanip>
@@ -204,6 +205,9 @@ struct ProbeOptions
   int status_count = 10;
   bool send_hold_command = true;
   bool bootstrap_rmi = true;
+  bool wiggle_j6 = false;
+  double j6_amplitude_deg = 10.0;
+  int sine_period_ms = 2000;
   std::optional<uint32_t> start_version_override;
   std::optional<std::string> command_mode_override;
 };
@@ -214,7 +218,7 @@ ProbeOptions parseArgs(int argc, char** argv)
   {
     throw std::invalid_argument(
       "Usage: manual_stream_motion_probe <robot_ip> [--timeout-ms N] [--status-count N] [--no-command] "
-      "[--no-rmi-bootstrap] "
+      "[--no-rmi-bootstrap] [--wiggle-j6] [--j6-amplitude-deg N] [--sine-period-ms N] "
       "[--start-version N] [--command-mode float|double]");
   }
 
@@ -238,6 +242,18 @@ ProbeOptions parseArgs(int argc, char** argv)
     else if (arg == "--no-rmi-bootstrap")
     {
       options.bootstrap_rmi = false;
+    }
+    else if (arg == "--wiggle-j6")
+    {
+      options.wiggle_j6 = true;
+    }
+    else if (arg == "--j6-amplitude-deg" && i + 1 < argc)
+    {
+      options.j6_amplitude_deg = std::stod(argv[++i]);
+    }
+    else if (arg == "--sine-period-ms" && i + 1 < argc)
+    {
+      options.sine_period_ms = std::stoi(argv[++i]);
     }
     else if (arg == "--start-version" && i + 1 < argc)
     {
@@ -305,13 +321,38 @@ void printStatusSummary(const StatusPacketV1& packet)
             << " cmd_received=" << static_cast<int>(packet.status & 0x2 ? 1 : 0)
             << " sysrdy=" << static_cast<int>(packet.status & 0x4 ? 1 : 0)
             << " moving=" << static_cast<int>(packet.status & 0x8 ? 1 : 0)
-            << " timestamp_ms=" << fromBigEndian(packet.time_stamp)
-            << " J1=" << fromBigEndianFloat(packet.joints[0]) << " J2=" << fromBigEndianFloat(packet.joints[1])
-            << " J3=" << fromBigEndianFloat(packet.joints[2]) << std::endl;
+            << " timestamp_ms=" << fromBigEndian(packet.time_stamp);
+  for (size_t i = 0; i < 6; ++i)
+  {
+    std::cout << " J" << (i + 1) << '=' << fromBigEndianFloat(packet.joints[i]);
+  }
+  std::cout << std::endl;
 }
 
-void sendFloatHoldCommand(sockpp::udp_socket& socket, const uint32_t version, const uint32_t sequence_no,
-                          const StatusPacketV1& status, const bool last_data = false)
+std::array<float, 9> getCommandJoints(const StatusPacketV1& status, const ProbeOptions& options,
+                                      const std::optional<std::array<float, 9>>& initial_joints,
+                                      const uint32_t initial_timestamp_ms)
+{
+  constexpr double kPi = 3.14159265358979323846;
+  std::array<float, 9> command_joints{};
+  for (size_t i = 0; i < command_joints.size(); ++i)
+  {
+    command_joints[i] = initial_joints.has_value() ? (*initial_joints)[i] : fromBigEndianFloat(status.joints[i]);
+  }
+
+  if (options.wiggle_j6)
+  {
+    const uint32_t current_timestamp_ms = fromBigEndian(status.time_stamp);
+    const double time_seconds = static_cast<double>(current_timestamp_ms - initial_timestamp_ms) / 1000.0;
+    const double omega = (2.0 * kPi) / (static_cast<double>(options.sine_period_ms) / 1000.0);
+    command_joints[5] = static_cast<float>(command_joints[5] + options.j6_amplitude_deg * std::sin(omega * time_seconds));
+  }
+
+  return command_joints;
+}
+
+void sendFloatCommand(sockpp::udp_socket& socket, const uint32_t version, const uint32_t sequence_no,
+                      const std::array<float, 9>& command_joints, const bool last_data = false)
 {
   CommandPacketFloat command{};
   command.packet_type = toBigEndian<uint32_t>(1);
@@ -329,7 +370,7 @@ void sendFloatHoldCommand(sockpp::udp_socket& socket, const uint32_t version, co
   command.unused = toBigEndian<uint16_t>(0);
   for (size_t i = 0; i < command.command.size(); ++i)
   {
-    setBigEndianFloat(command.command[i], fromBigEndianFloat(status.joints[i]));
+    setBigEndianFloat(command.command[i], command_joints[i]);
   }
 
   const auto res = socket.send(&command, sizeof(command));
@@ -337,12 +378,12 @@ void sendFloatHoldCommand(sockpp::udp_socket& socket, const uint32_t version, co
   {
     throw std::runtime_error("Failed to send float command packet: " + res.error_message());
   }
-  std::cout << "Sent float hold-position command with sequence " << sequence_no
-            << " last_data=" << static_cast<int>(command.last_data) << std::endl;
+  std::cout << "Sent float command with sequence " << sequence_no << " last_data=" << static_cast<int>(command.last_data)
+            << " J6=" << command_joints[5] << std::endl;
 }
 
-void sendDoubleHoldCommand(sockpp::udp_socket& socket, const uint32_t version, const uint32_t sequence_no,
-                           const StatusPacketV1& status, const bool last_data = false)
+void sendDoubleCommand(sockpp::udp_socket& socket, const uint32_t version, const uint32_t sequence_no,
+                       const std::array<float, 9>& command_joints, const bool last_data = false)
 {
   CommandPacketDouble command{};
   command.packet_type = toBigEndian<uint32_t>(5);
@@ -361,7 +402,7 @@ void sendDoubleHoldCommand(sockpp::udp_socket& socket, const uint32_t version, c
   command.unused32 = toBigEndian<uint32_t>(0);
   for (size_t i = 0; i < command.command.size(); ++i)
   {
-    setBigEndianDouble(command.command[i], static_cast<double>(fromBigEndianFloat(status.joints[i])));
+    setBigEndianDouble(command.command[i], static_cast<double>(command_joints[i]));
   }
 
   const auto res = socket.send(&command, sizeof(command));
@@ -369,20 +410,21 @@ void sendDoubleHoldCommand(sockpp::udp_socket& socket, const uint32_t version, c
   {
     throw std::runtime_error("Failed to send double command packet: " + res.error_message());
   }
-  std::cout << "Sent double hold-position command with sequence " << sequence_no
-            << " last_data=" << static_cast<int>(command.last_data) << std::endl;
+  std::cout << "Sent double command with sequence " << sequence_no
+            << " last_data=" << static_cast<int>(command.last_data) << " J6=" << command_joints[5] << std::endl;
 }
 
-void sendHoldCommand(sockpp::udp_socket& socket, const uint32_t version, const uint32_t sequence_no,
-                     const StatusPacketV1& status, const std::string& command_mode, const bool last_data = false)
+void sendCommand(sockpp::udp_socket& socket, const uint32_t version, const uint32_t sequence_no,
+                 const std::array<float, 9>& command_joints, const std::string& command_mode,
+                 const bool last_data = false)
 {
   if (command_mode == "double")
   {
-    sendDoubleHoldCommand(socket, version, sequence_no, status, last_data);
+    sendDoubleCommand(socket, version, sequence_no, command_joints, last_data);
   }
   else if (command_mode == "float")
   {
-    sendFloatHoldCommand(socket, version, sequence_no, status, last_data);
+    sendFloatCommand(socket, version, sequence_no, command_joints, last_data);
   }
   else
   {
@@ -405,6 +447,8 @@ bool runStatusProbe(sockpp::udp_socket& socket, const ProbeOptions& options, con
   bool got_status = false;
   std::string command_mode = options.command_mode_override.value_or(start_version >= 2 ? "double" : "float");
   std::optional<StatusPacketV1> last_status;
+  std::optional<std::array<float, 9>> initial_joints;
+  std::optional<uint32_t> initial_timestamp_ms;
 
   for (int i = 0; i < options.status_count; ++i)
   {
@@ -438,19 +482,32 @@ bool runStatusProbe(sockpp::udp_socket& socket, const ProbeOptions& options, con
     std::memcpy(&status, buffer.data(), sizeof(status));
     printStatusSummary(status);
     last_status = status;
+    if (!initial_joints.has_value())
+    {
+      std::array<float, 9> seed{};
+      for (size_t joint_idx = 0; joint_idx < seed.size(); ++joint_idx)
+      {
+        seed[joint_idx] = fromBigEndianFloat(status.joints[joint_idx]);
+      }
+      initial_joints = seed;
+      initial_timestamp_ms = fromBigEndian(status.time_stamp);
+    }
 
-    if (options.send_hold_command && (status.status & 0x1) != 0)
+    if (options.send_hold_command && (status.status & 0x1) != 0 && initial_timestamp_ms.has_value())
     {
       const uint32_t command_sequence = fromBigEndian(status.sequence_no);
-      sendHoldCommand(socket, start_version, command_sequence, status, command_mode, false);
+      const auto command_joints = getCommandJoints(status, options, initial_joints, *initial_timestamp_ms);
+      sendCommand(socket, start_version, command_sequence, command_joints, command_mode, false);
       started_command_stream = true;
     }
   }
 
-  if (options.send_hold_command && started_command_stream && last_status.has_value())
+  if (options.send_hold_command && started_command_stream && last_status.has_value() && initial_joints.has_value() &&
+      initial_timestamp_ms.has_value())
   {
     const uint32_t final_sequence = fromBigEndian(last_status->sequence_no);
-    sendHoldCommand(socket, start_version, final_sequence, *last_status, command_mode, true);
+    const auto command_joints = getCommandJoints(*last_status, options, initial_joints, *initial_timestamp_ms);
+    sendCommand(socket, start_version, final_sequence, command_joints, command_mode, true);
   }
 
   StatusStopPacket stop_packet{ toBigEndian<uint32_t>(2), toBigEndian(start_version) };
