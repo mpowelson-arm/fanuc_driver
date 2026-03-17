@@ -9,6 +9,9 @@ target_link_libraries(stream_motion_example PRIVATE stream_motion)
 add_executable(manual_stream_motion_probe manual_stream_motion_probe.cpp)
 target_link_libraries(manual_stream_motion_probe PRIVATE rmi Sockpp::sockpp)
 
+add_executable(manual_stream_motion_probe_simple manual_stream_motion_probe_simple.cpp)
+target_link_libraries(manual_stream_motion_probe_simple PRIVATE rmi Sockpp::sockpp)
+
 add_executable(rmi_connection_example rmi_connection_example.cpp)
 target_link_libraries(rmi_connection_example PRIVATE rmi)
 
