@@ -180,6 +180,7 @@ private:
   // Manages stream motion connection
   std::atomic<bool> is_streaming_ = false;
   std::chrono::time_point<std::chrono::high_resolution_clock> start_time_;
+  std::chrono::time_point<std::chrono::steady_clock> stream_start_steady_time_;
   std::unique_ptr<stream_motion::StreamMotionInterface> stream_motion_;
 
   std::array<double, stream_motion::kMaxAxisNumber> command_pos;

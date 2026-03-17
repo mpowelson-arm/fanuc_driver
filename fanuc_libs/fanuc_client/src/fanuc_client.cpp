@@ -26,6 +26,8 @@ struct sigaction FanucClient::previous_sigaction_;
 namespace
 {
 constexpr double kFullPayload = 7.0;
+constexpr auto kStartupHoldCommandDebugDuration = std::chrono::seconds(10);
+constexpr Eigen::Index kA4AxisIndex = 3;
 constexpr auto kStatusPacketFailureMessage = "Invalid robot status packet. Make sure the robot connected can be "
                                              "reached on the network and is in a running state.";
 constexpr auto kStatusStatusNotReadyMessage = "Stream motion control is not ready. Check if the robot has alarms "
@@ -257,6 +259,14 @@ Eigen::Ref<const Eigen::VectorXd> FanucClient::readJointAngles()
   AssertIsStreaming(is_streaming_);
   readStateFromQueue();
 
+  if ((std::chrono::steady_clock::now() - stream_start_steady_time_) < kStartupHoldCommandDebugDuration)
+  {
+    for (Eigen::Index i = 0; i < last_joint_angles_.size(); ++i)
+    {
+      last_joint_angles_[i] = command_pos[i];
+    }
+  }
+
   return last_joint_angles_;
 }
 
@@ -302,6 +312,18 @@ void FanucClient::streamMotionThread(const Eigen::VectorXd& joint_angles)
   double ts_drift = 0.0;
   double dev_time = 0.0;
   double dev_time_prev = 0.0;
+  const auto thread_start_time = std::chrono::steady_clock::now();
+  bool logged_first_status_a4 = false;
+  bool logged_first_ros_target_a4 = false;
+  bool logged_hold_start = false;
+  bool logged_hold_end = false;
+
+  if (joint_angles.size() > kA4AxisIndex)
+  {
+    std::cout << "[StreamMotionDebug] Holding initial command-position for "
+              << std::chrono::duration_cast<std::chrono::seconds>(kStartupHoldCommandDebugDuration).count()
+              << "s. initial_command[A4]=" << joint_angles[kA4AxisIndex] << std::endl;
+  }
 
   while (is_streaming_)
   {
@@ -311,62 +333,108 @@ void FanucClient::streamMotionThread(const Eigen::VectorXd& joint_angles)
       is_streaming_ = false;
     }
 
-    // set estimated time to first command's timestamp
-    if ((dev_time == 0.0) && (p_queue_impl_->command_queue_.size_approx() != 0))
+    if (!logged_first_status_a4 && status.joint_angle.size() > kA4AxisIndex)
     {
-      const PQueueImpl::StampedEigen* queue_entry = p_queue_impl_->command_queue_.peek();
-      dev_time = std::get<0>(*queue_entry).count();
-      dev_time_prev = dev_time;
+      logged_first_status_a4 = true;
+      std::cout << "[StreamMotionDebug] First servo status[A4]=" << status.joint_angle[kA4AxisIndex]
+                << " sequence_no=" << status.sequence_no << std::endl;
+    }
+
+    const bool hold_initial_command =
+        (std::chrono::steady_clock::now() - thread_start_time) < kStartupHoldCommandDebugDuration;
+    if (hold_initial_command)
+    {
+      if (!logged_hold_start)
+      {
+        logged_hold_start = true;
+        std::cout << "[StreamMotionDebug] Ignoring ROS command queue during startup hold window." << std::endl;
+      }
+
+      PQueueImpl::StampedEigen dropped_entry;
+      while (p_queue_impl_->command_queue_.try_dequeue(dropped_entry))
+      {
+        const Eigen::VectorXd& dropped_command = std::get<1>(dropped_entry);
+        if (!logged_first_ros_target_a4 && dropped_command.size() > kA4AxisIndex)
+        {
+          logged_first_ros_target_a4 = true;
+          std::cout << "[StreamMotionDebug] First queued ROS target[A4]=" << dropped_command[kA4AxisIndex]
+                    << " timestamp=" << std::get<0>(dropped_entry).count() << std::endl;
+        }
+      }
+
+      command = joint_angles;
+      last_command = joint_angles;
+      command_timestamp = 0.0;
+      last_command_timestamp = 0.0;
+      ts_drift = 0.0;
+      dev_time = 0.0;
+      dev_time_prev = 0.0;
+      for (Eigen::Index i = 0; i < status.joint_angle.size(); ++i)
+      {
+        command_pos[i] = joint_angles[i];
+      }
     }
     else
     {
-      // calculate drift
-      double time_error = static_cast<double>(p_queue_impl_->command_queue_.size_approx()) -
-                          static_cast<double>(out_cmd_interp_buff_target_);
-      ts_drift = 0.99 * ts_drift + time_error * 0.000001;
+      if (!logged_hold_end)
+      {
+        logged_hold_end = true;
+        std::cout << "[StreamMotionDebug] Startup hold window ended; resuming ROS command queue consumption."
+                  << std::endl;
+      }
 
-      // push the time forward
-      dev_time_prev = dev_time;
-      dev_time += (getControlPeriod() / 1000.0) + ts_drift;
-    }
-
-    int size_before = p_queue_impl_->command_queue_.size_approx();
-
-    // find the right interval to use.
-    while (p_queue_impl_->command_queue_.size_approx() != 0)
-    {
-      const PQueueImpl::StampedEigen* queue_entry = p_queue_impl_->command_queue_.peek();
-      last_command = command;
-      last_command_timestamp = command_timestamp;
-      command_timestamp = std::get<0>(*queue_entry).count();
-      command = std::get<1>(*queue_entry);
       if (dev_time == 0.0)
       {
-        dev_time = command_timestamp;
-        dev_time_prev = command_timestamp;
+        const PQueueImpl::StampedEigen* queue_entry = p_queue_impl_->command_queue_.peek();
+        if (queue_entry != nullptr)
+        {
+          dev_time = std::get<0>(*queue_entry).count();
+          dev_time_prev = dev_time;
+        }
       }
-      if (command_timestamp >= dev_time_prev)
+      else
       {
-        break;
-      }
-      p_queue_impl_->command_queue_.pop();
-    }
+        // calculate drift
+        double time_error = static_cast<double>(p_queue_impl_->command_queue_.size_approx()) -
+                            static_cast<double>(out_cmd_interp_buff_target_);
+        ts_drift = 0.99 * ts_drift + time_error * 0.000001;
 
-    // Do interpolation.
-    double alpha;
-    if (command_timestamp - last_command_timestamp < 1e-6)
-    {
-      alpha = 0;
-    }
-    else
-    {
-      alpha = (dev_time_prev - last_command_timestamp) / (command_timestamp - last_command_timestamp);
-    }
-    alpha = std::min(alpha, 1.0);
-    alpha = std::max(alpha, 0.0);
-    for (Eigen::Index i = 0; i < status.joint_angle.size(); ++i)
-    {
-      command_pos[i] = alpha * command[i] + (1.0 - alpha) * last_command[i];
+        // push the time forward
+        dev_time_prev = dev_time;
+        dev_time += (getControlPeriod() / 1000.0) + ts_drift;
+      }
+
+      // find the right interval to use.
+      while (p_queue_impl_->command_queue_.size_approx() != 0)
+      {
+        const PQueueImpl::StampedEigen* queue_entry = p_queue_impl_->command_queue_.peek();
+        last_command = command;
+        last_command_timestamp = command_timestamp;
+        command_timestamp = std::get<0>(*queue_entry).count();
+        command = std::get<1>(*queue_entry);
+        if (command_timestamp >= dev_time_prev)
+        {
+          break;
+        }
+        p_queue_impl_->command_queue_.pop();
+      }
+
+      // Do interpolation.
+      double alpha;
+      if (command_timestamp - last_command_timestamp < 1e-6)
+      {
+        alpha = 0;
+      }
+      else
+      {
+        alpha = (dev_time_prev - last_command_timestamp) / (command_timestamp - last_command_timestamp);
+      }
+      alpha = std::min(alpha, 1.0);
+      alpha = std::max(alpha, 0.0);
+      for (Eigen::Index i = 0; i < status.joint_angle.size(); ++i)
+      {
+        command_pos[i] = alpha * command[i] + (1.0 - alpha) * last_command[i];
+      }
     }
 
     // Handle IO commands.
@@ -574,6 +642,7 @@ void FanucClient::startRealtimeStream(std::shared_ptr<GPIOBuffer> gpio_buffer)
     }
   }
   start_time_ = std::chrono::high_resolution_clock::now();
+  stream_start_steady_time_ = std::chrono::steady_clock::now();
   p_queue_impl_->robot_state_queue_.enqueue(status);
   is_streaming_ = true;
   last_joint_angles_ = Eigen::VectorXd::Zero(status.joint_angle.size());
