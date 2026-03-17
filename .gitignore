@@ -8,3 +8,5 @@ log
 *.swp
 .idea/
 .vscode/
+
+fanuc_libs/build-manual-probe*

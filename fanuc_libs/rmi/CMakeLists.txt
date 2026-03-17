@@ -9,7 +9,7 @@ project(rmi)
 add_library(rmi SHARED src/rmi.cpp src/serialization.cpp src/deserialization.cpp)
 target_link_libraries(rmi PRIVATE reflectcpp Sockpp::sockpp)
 target_include_directories(rmi PUBLIC
-    PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
     $<INSTALL_INTERFACE:include>
 )
 set_target_properties(rmi PROPERTIES CXX_STANDARD 20)
