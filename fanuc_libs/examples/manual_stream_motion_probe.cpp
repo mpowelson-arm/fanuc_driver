@@ -2,10 +2,12 @@
 #include <array>
 #include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <cstdint>
 #include <cstring>
 #include <iomanip>
 #include <iostream>
+#include <mutex>
 #include <optional>
 #include <sstream>
 #include <stdexcept>
@@ -546,11 +548,19 @@ bool runStatusProbe(sockpp::udp_socket& socket, const ProbeOptions& options, con
 
   bool started_command_stream = false;
   bool got_status = false;
-  std::string command_mode = options.command_mode_override.value_or(start_version >= 2 ? "double" : "float");
   std::optional<StatusPacketV1> last_status;
   std::optional<std::array<float, 9>> initial_joints;
   std::optional<uint32_t> initial_timestamp_ms;
-  std::optional<uint32_t> next_command_sequence;
+  std::mutex command_mutex;
+  bool receiver_finished = false;
+  bool have_command_state = false;
+  uint32_t next_command_sequence = 0;
+  int latest_packet_index = 0;
+  StatusPacketV1 latest_status_for_command{};
+  const uint32_t session_version = start_version;
+  const std::string session_command_mode =
+    options.command_mode_override.value_or(session_version >= 2 ? "double" : "float");
+  uint32_t send_period_us = 2000;
 
   if (const auto command_position = requestCommandPosition(socket, options.timeout_ms))
   {
@@ -570,6 +580,68 @@ bool runStatusProbe(sockpp::udp_socket& socket, const ProbeOptions& options, con
               << std::endl;
   }
 
+  std::thread sender_thread([&]() {
+    auto next_send_time = std::chrono::steady_clock::now();
+    bool has_sent_command = false;
+    while (true)
+    {
+      std::array<float, 9> command_joints{};
+      uint32_t command_sequence = 0;
+      int packet_index = 0;
+      bool should_send = false;
+      StatusPacketV1 status_for_command{};
+      uint32_t version_to_use = session_version;
+      std::string command_mode_to_use;
+      uint32_t send_period_local_us = 2000;
+
+      {
+        std::lock_guard lock(command_mutex);
+        if (have_command_state && !receiver_finished)
+        {
+          status_for_command = latest_status_for_command;
+          command_sequence = next_command_sequence;
+          packet_index = latest_packet_index;
+          should_send = true;
+          version_to_use = session_version;
+          command_mode_to_use = session_command_mode;
+          send_period_local_us = send_period_us;
+          ++next_command_sequence;
+        }
+        else if (receiver_finished)
+        {
+          break;
+        }
+      }
+
+      if (!should_send)
+      {
+        std::this_thread::sleep_for(std::chrono::microseconds(100));
+        continue;
+      }
+
+      const auto now = std::chrono::steady_clock::now();
+      if (!has_sent_command)
+      {
+        next_send_time = now;
+      }
+      else if (now < next_send_time)
+      {
+        std::this_thread::sleep_until(next_send_time);
+      }
+      else if (now - next_send_time > std::chrono::milliseconds(10))
+      {
+        next_send_time = now;
+      }
+
+      command_joints = getCommandJoints(status_for_command, options, initial_joints, *initial_timestamp_ms);
+      sendCommand(socket, version_to_use, command_sequence, command_joints, options.joint_number, packet_index,
+                  options.log_every, command_mode_to_use, false);
+      has_sent_command = true;
+      next_send_time += std::chrono::microseconds(send_period_local_us);
+    }
+  });
+
+  std::optional<uint32_t> previous_status_timestamp_ms;
   for (int i = 0; i < options.status_count; ++i)
   {
     std::vector<uint8_t> buffer;
@@ -607,6 +679,16 @@ bool runStatusProbe(sockpp::udp_socket& socket, const ProbeOptions& options, con
     {
       printStatusSummary(status, i);
     }
+    const uint32_t current_timestamp_ms = fromBigEndian(status.time_stamp);
+    if (previous_status_timestamp_ms.has_value())
+    {
+      const uint32_t delta_ms = current_timestamp_ms - *previous_status_timestamp_ms;
+      if (delta_ms > 0)
+      {
+        send_period_us = delta_ms * 1000;
+      }
+    }
+    previous_status_timestamp_ms = current_timestamp_ms;
     last_status = status;
     if (!initial_joints.has_value())
     {
@@ -628,33 +710,42 @@ bool runStatusProbe(sockpp::udp_socket& socket, const ProbeOptions& options, con
 
     if (options.send_hold_command && (status.status & 0x1) != 0 && initial_timestamp_ms.has_value())
     {
-      if (!next_command_sequence.has_value())
+      std::lock_guard lock(command_mutex);
+      if (!have_command_state)
       {
         next_command_sequence = fromBigEndian(status.sequence_no);
+        have_command_state = true;
       }
-      const auto command_joints = getCommandJoints(status, options, initial_joints, *initial_timestamp_ms);
-      sendCommand(socket, start_version, *next_command_sequence, command_joints, options.joint_number, i,
-                  options.log_every, command_mode, false);
-      *next_command_sequence = *next_command_sequence + 1;
+      latest_status_for_command = status;
+      latest_packet_index = i;
       started_command_stream = true;
     }
   }
 
-  if (options.send_hold_command && started_command_stream && last_status.has_value() && initial_joints.has_value() &&
-      initial_timestamp_ms.has_value() && next_command_sequence.has_value())
   {
-    const auto command_joints = getCommandJoints(*last_status, options, initial_joints, *initial_timestamp_ms);
-    sendCommand(socket, start_version, *next_command_sequence, command_joints, options.joint_number, options.status_count,
-                options.log_every, command_mode, true);
+    std::lock_guard lock(command_mutex);
+    receiver_finished = true;
+  }
+  if (sender_thread.joinable())
+  {
+    sender_thread.join();
   }
 
-  StatusStopPacket stop_packet{ toBigEndian<uint32_t>(2), toBigEndian(start_version) };
+  if (options.send_hold_command && started_command_stream && last_status.has_value() && initial_joints.has_value() &&
+      initial_timestamp_ms.has_value())
+  {
+    const auto command_joints = getCommandJoints(*last_status, options, initial_joints, *initial_timestamp_ms);
+    sendCommand(socket, session_version, next_command_sequence, command_joints, options.joint_number, options.status_count,
+                options.log_every, session_command_mode, true);
+  }
+
+  StatusStopPacket stop_packet{ toBigEndian<uint32_t>(2), toBigEndian(session_version) };
   send_res = socket.send(&stop_packet, sizeof(stop_packet));
   if (!send_res || send_res.value() != sizeof(stop_packet))
   {
     throw std::runtime_error("Failed to send status-stop packet: " + send_res.error_message());
   }
-  std::cout << "Sent status-stop packet with version " << start_version << std::endl;
+  std::cout << "Sent status-stop packet with version " << session_version << std::endl;
 
   return got_status;
 }
@@ -721,6 +812,7 @@ int main(int argc, char** argv)
     }
     else
     {
+      versions_to_try.push_back(2);
       versions_to_try.push_back(1);
     }
 
