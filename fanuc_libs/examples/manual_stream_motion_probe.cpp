@@ -138,6 +138,21 @@ struct StatusStopPacket
   uint32_t version_no;
 };
 
+struct CommandPositionRequestPacket
+{
+  uint32_t packet_type;
+  uint32_t version_no;
+};
+
+struct CommandPositionResponsePacket
+{
+  uint32_t packet_type;
+  uint32_t version_no;
+  uint32_t time_stamp;
+  std::array<float, 9> cart{};
+  std::array<float, 9> joints{};
+};
+
 struct StatusPacketV1
 {
   uint32_t packet_type;
@@ -195,6 +210,8 @@ struct CommandPacketDouble
 
 static_assert(sizeof(VersionRequestPacket) == 8);
 static_assert(sizeof(StatusPacketV1) == 132);
+static_assert(sizeof(CommandPositionRequestPacket) == 8);
+static_assert(sizeof(CommandPositionResponsePacket) == 84);
 static_assert(sizeof(CommandPacketFloat) == 64);
 static_assert(sizeof(CommandPacketDouble) == 104);
 
@@ -208,6 +225,11 @@ struct ProbeOptions
   bool wiggle_j6 = false;
   double j6_amplitude_deg = 10.0;
   int sine_period_ms = 2000;
+  int joint_number = 6;
+  std::optional<double> joint_delta_deg;
+  int rotate_duration_ms = 5000;
+  int start_delay_ms = 500;
+  int log_every = 25;
   std::optional<uint32_t> start_version_override;
   std::optional<std::string> command_mode_override;
 };
@@ -219,6 +241,7 @@ ProbeOptions parseArgs(int argc, char** argv)
     throw std::invalid_argument(
       "Usage: manual_stream_motion_probe <robot_ip> [--timeout-ms N] [--status-count N] [--no-command] "
       "[--no-rmi-bootstrap] [--wiggle-j6] [--j6-amplitude-deg N] [--sine-period-ms N] "
+      "[--joint-number N] [--joint-delta-deg N] [--rotate-duration-ms N] [--start-delay-ms N] [--log-every N] "
       "[--start-version N] [--command-mode float|double]");
   }
 
@@ -254,6 +277,26 @@ ProbeOptions parseArgs(int argc, char** argv)
     else if (arg == "--sine-period-ms" && i + 1 < argc)
     {
       options.sine_period_ms = std::stoi(argv[++i]);
+    }
+    else if (arg == "--joint-number" && i + 1 < argc)
+    {
+      options.joint_number = std::stoi(argv[++i]);
+    }
+    else if (arg == "--joint-delta-deg" && i + 1 < argc)
+    {
+      options.joint_delta_deg = std::stod(argv[++i]);
+    }
+    else if (arg == "--rotate-duration-ms" && i + 1 < argc)
+    {
+      options.rotate_duration_ms = std::stoi(argv[++i]);
+    }
+    else if (arg == "--start-delay-ms" && i + 1 < argc)
+    {
+      options.start_delay_ms = std::stoi(argv[++i]);
+    }
+    else if (arg == "--log-every" && i + 1 < argc)
+    {
+      options.log_every = std::stoi(argv[++i]);
     }
     else if (arg == "--start-version" && i + 1 < argc)
     {
@@ -308,14 +351,46 @@ bool receivePacket(sockpp::udp_socket& socket, std::vector<uint8_t>& buffer, con
       buffer.resize(res.value());
       return true;
     }
-    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    std::this_thread::sleep_for(std::chrono::microseconds(100));
   }
   return false;
 }
 
-void printStatusSummary(const StatusPacketV1& packet)
+std::optional<CommandPositionResponsePacket> requestCommandPosition(sockpp::udp_socket& socket, const int timeout_ms)
 {
-  std::cout << "Status packet: seq=" << fromBigEndian(packet.sequence_no)
+  CommandPositionRequestPacket request{ toBigEndian<uint32_t>(4), toBigEndian<uint32_t>(1) };
+  const auto send_res = socket.send(&request, sizeof(request));
+  if (!send_res || send_res.value() != sizeof(request))
+  {
+    throw std::runtime_error("Failed to send command-position request packet: " + send_res.error_message());
+  }
+
+  const auto start = std::chrono::steady_clock::now();
+  while (std::chrono::steady_clock::now() - start < std::chrono::milliseconds(timeout_ms))
+  {
+    std::vector<uint8_t> buffer;
+    if (!receivePacket(socket, buffer, 100))
+    {
+      continue;
+    }
+
+    const uint32_t packet_type = buffer.size() >= 4 ? readHeaderField(buffer.data(), 0) : 0xFFFFFFFF;
+    if (packet_type != 4 || buffer.size() != sizeof(CommandPositionResponsePacket))
+    {
+      continue;
+    }
+
+    CommandPositionResponsePacket response{};
+    std::memcpy(&response, buffer.data(), sizeof(response));
+    return response;
+  }
+
+  return std::nullopt;
+}
+
+void printStatusSummary(const StatusPacketV1& packet, const int packet_index)
+{
+  std::cout << "Status packet[" << packet_index << "]: seq=" << fromBigEndian(packet.sequence_no)
             << " status=0x" << std::hex << std::setw(2) << std::setfill('0') << static_cast<unsigned>(packet.status)
             << std::dec << " waiting=" << static_cast<int>(packet.status & 0x1 ? 1 : 0)
             << " cmd_received=" << static_cast<int>(packet.status & 0x2 ? 1 : 0)
@@ -340,7 +415,23 @@ std::array<float, 9> getCommandJoints(const StatusPacketV1& status, const ProbeO
     command_joints[i] = initial_joints.has_value() ? (*initial_joints)[i] : fromBigEndianFloat(status.joints[i]);
   }
 
-  if (options.wiggle_j6)
+  const size_t joint_index = static_cast<size_t>(options.joint_number - 1);
+  if (joint_index >= command_joints.size())
+  {
+    throw std::out_of_range("joint-number must be between 1 and 9.");
+  }
+
+  if (options.joint_delta_deg.has_value())
+  {
+    const uint32_t current_timestamp_ms = fromBigEndian(status.time_stamp);
+    const double elapsed_ms = static_cast<double>(current_timestamp_ms - initial_timestamp_ms);
+    const double move_elapsed_ms = std::max(0.0, elapsed_ms - static_cast<double>(options.start_delay_ms));
+    const double u = std::clamp(move_elapsed_ms / static_cast<double>(options.rotate_duration_ms), 0.0, 1.0);
+    const double progress = (10.0 * u * u * u) - (15.0 * u * u * u * u) + (6.0 * u * u * u * u * u);
+    command_joints[joint_index] =
+      static_cast<float>(command_joints[joint_index] + (*options.joint_delta_deg * progress));
+  }
+  else if (options.wiggle_j6)
   {
     const uint32_t current_timestamp_ms = fromBigEndian(status.time_stamp);
     const double time_seconds = static_cast<double>(current_timestamp_ms - initial_timestamp_ms) / 1000.0;
@@ -352,7 +443,8 @@ std::array<float, 9> getCommandJoints(const StatusPacketV1& status, const ProbeO
 }
 
 void sendFloatCommand(sockpp::udp_socket& socket, const uint32_t version, const uint32_t sequence_no,
-                      const std::array<float, 9>& command_joints, const bool last_data = false)
+                      const std::array<float, 9>& command_joints, const int joint_number, const int packet_index,
+                      const int log_every, const bool last_data = false)
 {
   CommandPacketFloat command{};
   command.packet_type = toBigEndian<uint32_t>(1);
@@ -378,12 +470,17 @@ void sendFloatCommand(sockpp::udp_socket& socket, const uint32_t version, const 
   {
     throw std::runtime_error("Failed to send float command packet: " + res.error_message());
   }
-  std::cout << "Sent float command with sequence " << sequence_no << " last_data=" << static_cast<int>(command.last_data)
-            << " J6=" << command_joints[5] << std::endl;
+  if (last_data || packet_index == 0 || (log_every > 0 && packet_index % log_every == 0))
+  {
+    std::cout << "Sent float command[" << packet_index << "] with sequence " << sequence_no
+              << " last_data=" << static_cast<int>(command.last_data) << " J" << joint_number << "="
+              << command_joints[static_cast<size_t>(joint_number - 1)] << std::endl;
+  }
 }
 
 void sendDoubleCommand(sockpp::udp_socket& socket, const uint32_t version, const uint32_t sequence_no,
-                       const std::array<float, 9>& command_joints, const bool last_data = false)
+                       const std::array<float, 9>& command_joints, const int joint_number, const int packet_index,
+                       const int log_every, const bool last_data = false)
 {
   CommandPacketDouble command{};
   command.packet_type = toBigEndian<uint32_t>(5);
@@ -410,21 +507,25 @@ void sendDoubleCommand(sockpp::udp_socket& socket, const uint32_t version, const
   {
     throw std::runtime_error("Failed to send double command packet: " + res.error_message());
   }
-  std::cout << "Sent double command with sequence " << sequence_no
-            << " last_data=" << static_cast<int>(command.last_data) << " J6=" << command_joints[5] << std::endl;
+  if (last_data || packet_index == 0 || (log_every > 0 && packet_index % log_every == 0))
+  {
+    std::cout << "Sent double command[" << packet_index << "] with sequence " << sequence_no
+              << " last_data=" << static_cast<int>(command.last_data) << " J" << joint_number << "="
+              << command_joints[static_cast<size_t>(joint_number - 1)] << std::endl;
+  }
 }
 
 void sendCommand(sockpp::udp_socket& socket, const uint32_t version, const uint32_t sequence_no,
-                 const std::array<float, 9>& command_joints, const std::string& command_mode,
-                 const bool last_data = false)
+                 const std::array<float, 9>& command_joints, const int joint_number, const int packet_index,
+                 const int log_every, const std::string& command_mode, const bool last_data = false)
 {
   if (command_mode == "double")
   {
-    sendDoubleCommand(socket, version, sequence_no, command_joints, last_data);
+    sendDoubleCommand(socket, version, sequence_no, command_joints, joint_number, packet_index, log_every, last_data);
   }
   else if (command_mode == "float")
   {
-    sendFloatCommand(socket, version, sequence_no, command_joints, last_data);
+    sendFloatCommand(socket, version, sequence_no, command_joints, joint_number, packet_index, log_every, last_data);
   }
   else
   {
@@ -449,6 +550,25 @@ bool runStatusProbe(sockpp::udp_socket& socket, const ProbeOptions& options, con
   std::optional<StatusPacketV1> last_status;
   std::optional<std::array<float, 9>> initial_joints;
   std::optional<uint32_t> initial_timestamp_ms;
+  std::optional<uint32_t> next_command_sequence;
+
+  if (const auto command_position = requestCommandPosition(socket, options.timeout_ms))
+  {
+    std::array<float, 9> seed{};
+    for (size_t joint_idx = 0; joint_idx < seed.size(); ++joint_idx)
+    {
+      seed[joint_idx] = fromBigEndianFloat(command_position->joints[joint_idx]);
+    }
+    initial_joints = seed;
+    std::cout << "Seeded commands from command-position response."
+              << " J1=" << seed[0] << " J2=" << seed[1] << " J3=" << seed[2] << " J4=" << seed[3]
+              << " J5=" << seed[4] << " J6=" << seed[5] << " J7=" << seed[6] << std::endl;
+  }
+  else
+  {
+    std::cout << "Command-position response not received. Will fall back to status/servo position for initial command seed."
+              << std::endl;
+  }
 
   for (int i = 0; i < options.status_count; ++i)
   {
@@ -465,13 +585,16 @@ bool runStatusProbe(sockpp::udp_socket& socket, const ProbeOptions& options, con
     const uint32_t version_no = buffer.size() >= 8 ? readHeaderField(buffer.data(), 4) : 0xFFFFFFFF;
     const uint32_t sequence_no = buffer.size() >= 12 ? readHeaderField(buffer.data(), 8) : 0xFFFFFFFF;
 
-    std::cout << "Received UDP datagram: size=" << buffer.size() << " packet_type=" << packet_type
-              << " version=" << version_no;
-    if (buffer.size() >= 12)
+    if (i == 0 || (options.log_every > 0 && i % options.log_every == 0))
     {
-      std::cout << " sequence=" << sequence_no;
+      std::cout << "Received UDP datagram[" << i << "]: size=" << buffer.size() << " packet_type=" << packet_type
+                << " version=" << version_no;
+      if (buffer.size() >= 12)
+      {
+        std::cout << " sequence=" << sequence_no;
+      }
+      std::cout << " raw=" << formatBytes(buffer.data(), buffer.size()) << std::endl;
     }
-    std::cout << " raw=" << formatBytes(buffer.data(), buffer.size()) << std::endl;
 
     if (buffer.size() != sizeof(StatusPacketV1))
     {
@@ -480,7 +603,10 @@ bool runStatusProbe(sockpp::udp_socket& socket, const ProbeOptions& options, con
 
     StatusPacketV1 status{};
     std::memcpy(&status, buffer.data(), sizeof(status));
-    printStatusSummary(status);
+    if (i == 0 || (options.log_every > 0 && i % options.log_every == 0))
+    {
+      printStatusSummary(status, i);
+    }
     last_status = status;
     if (!initial_joints.has_value())
     {
@@ -490,24 +616,36 @@ bool runStatusProbe(sockpp::udp_socket& socket, const ProbeOptions& options, con
         seed[joint_idx] = fromBigEndianFloat(status.joints[joint_idx]);
       }
       initial_joints = seed;
+      std::cout << "Falling back to status/servo position for initial command seed."
+                << " J1=" << seed[0] << " J2=" << seed[1] << " J3=" << seed[2] << " J4=" << seed[3]
+                << " J5=" << seed[4] << " J6=" << seed[5] << " J7=" << seed[6] << std::endl;
+      initial_timestamp_ms = fromBigEndian(status.time_stamp);
+    }
+    if (!initial_timestamp_ms.has_value())
+    {
       initial_timestamp_ms = fromBigEndian(status.time_stamp);
     }
 
     if (options.send_hold_command && (status.status & 0x1) != 0 && initial_timestamp_ms.has_value())
     {
-      const uint32_t command_sequence = fromBigEndian(status.sequence_no);
+      if (!next_command_sequence.has_value())
+      {
+        next_command_sequence = fromBigEndian(status.sequence_no);
+      }
       const auto command_joints = getCommandJoints(status, options, initial_joints, *initial_timestamp_ms);
-      sendCommand(socket, start_version, command_sequence, command_joints, command_mode, false);
+      sendCommand(socket, start_version, *next_command_sequence, command_joints, options.joint_number, i,
+                  options.log_every, command_mode, false);
+      *next_command_sequence = *next_command_sequence + 1;
       started_command_stream = true;
     }
   }
 
   if (options.send_hold_command && started_command_stream && last_status.has_value() && initial_joints.has_value() &&
-      initial_timestamp_ms.has_value())
+      initial_timestamp_ms.has_value() && next_command_sequence.has_value())
   {
-    const uint32_t final_sequence = fromBigEndian(last_status->sequence_no);
     const auto command_joints = getCommandJoints(*last_status, options, initial_joints, *initial_timestamp_ms);
-    sendCommand(socket, start_version, final_sequence, command_joints, command_mode, true);
+    sendCommand(socket, start_version, *next_command_sequence, command_joints, options.joint_number, options.status_count,
+                options.log_every, command_mode, true);
   }
 
   StatusStopPacket stop_packet{ toBigEndian<uint32_t>(2), toBigEndian(start_version) };
