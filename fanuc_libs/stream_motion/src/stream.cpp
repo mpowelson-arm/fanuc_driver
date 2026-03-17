@@ -9,6 +9,7 @@
 #include <cmath>
 #include <cstring>
 #include <iomanip>
+#include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <thread>
@@ -265,6 +266,71 @@ struct StreamMotionConnection::PSocketImpl
         std::cerr << "Timeout while reading controller capability from UDP socket. Expected "
                   << sizeof(ControllerCapabilityResultPacket) << " or " << kR50ControllerCapabilityResponseSize
                   << " bytes from " << server_address << ". Last socket error: " << res.error_message() << std::endl;
+        return false;
+      }
+      std::this_thread::sleep_for(std::chrono::microseconds(100));
+    }
+  }
+
+  bool receiveCommandPosition(CommandPositionResponsePacket& command_position_response, const uint32_t version_no,
+                              std::optional<uint32_t>& latest_status_sequence)
+  {
+    command_position_response = CommandPositionResponsePacket{};
+    std::array<uint8_t, 512> raw_bytes{};
+    const auto start_time = std::chrono::steady_clock::now();
+    uint32_t discard_count = 0;
+    while (true)
+    {
+      sockpp::result<size_t> res = sock.recv(raw_bytes.data(), raw_bytes.size());
+      const bool has_value = static_cast<bool>(res);
+      const size_t received_size = has_value ? res.value() : 0;
+      if (received_size == sizeof(CommandPositionResponsePacket))
+      {
+        std::memcpy(&command_position_response, raw_bytes.data(), received_size);
+        CommandPositionResponsePacket swapped = command_position_response;
+        swapCommandPositionResponseBytes(swapped);
+        if (swapped.packet_type == kCommandPositionPacketType)
+        {
+          command_position_response = swapped;
+          return true;
+        }
+        if (ShouldLogDiscard(discard_count))
+        {
+          std::cerr << "Discarding unexpected packet while waiting for command-position response. size="
+                    << received_size << " packet_type=" << swapped.packet_type
+                    << " raw=" << FormatByteString(raw_bytes.data(), received_size) << std::endl;
+        }
+        continue;
+      }
+      if (version_no <= 2 && received_size == sizeof(LegacyRobotStatusPacket))
+      {
+        uint32_t sequence_no = 0;
+        std::memcpy(&sequence_no, raw_bytes.data() + offsetof(LegacyRobotStatusPacket, sequence_no), sizeof(sequence_no));
+        latest_status_sequence = swapBytesIfNeeded(sequence_no);
+        if (ShouldLogDiscard(discard_count))
+        {
+          std::cerr << "Observed legacy status packet while waiting for command-position response. seq="
+                    << *latest_status_sequence << " raw=" << FormatByteString(raw_bytes.data(), received_size)
+                    << std::endl;
+        }
+        continue;
+      }
+      if (has_value && received_size > 0)
+      {
+        if (ShouldLogDiscard(discard_count))
+        {
+          std::cerr << "Discarding unexpected UDP packet while waiting for command-position response. Expected "
+                    << sizeof(CommandPositionResponsePacket) << " bytes, got " << received_size << " bytes from "
+                    << server_address << ". Raw bytes: " << FormatByteString(raw_bytes.data(), received_size)
+                    << std::endl;
+        }
+        continue;
+      }
+      if (std::chrono::steady_clock::now() - start_time > std::chrono::duration<double>(timeout))
+      {
+        std::cerr << "Timeout while reading command-position response from UDP socket. Expected "
+                  << sizeof(CommandPositionResponsePacket) << " bytes from " << server_address
+                  << ". Last socket error: " << res.error_message() << std::endl;
         return false;
       }
       std::this_thread::sleep_for(std::chrono::microseconds(100));
@@ -578,23 +644,23 @@ bool StreamMotionConnection::getCommandPosition(std::array<double, kMaxAxisNumbe
   socket_impl_->send(request);
 
   CommandPositionResponsePacket response{};
-  if (!socket_impl_->receive(response))
+  std::optional<uint32_t> latest_status_sequence;
+  if (!socket_impl_->receiveCommandPosition(response, version_no_, latest_status_sequence))
   {
     std::cerr << "Failed to receive command-position response." << std::endl;
-    return false;
-  }
-
-  swapCommandPositionResponseBytes(response);
-  if (response.packet_type != kCommandPositionPacketType)
-  {
-    std::cerr << "Unexpected command-position packet type: " << response.packet_type
-              << " (expected " << kCommandPositionPacketType << ")." << std::endl;
     return false;
   }
 
   for (size_t i = 0; i < command_pos.size(); ++i)
   {
     command_pos[i] = static_cast<double>(response.joint_angle[i]);
+  }
+  if (version_no_ <= 2 && latest_status_sequence.has_value())
+  {
+    status_sequence_no_ = *latest_status_sequence;
+    command_sequence_no_ = *latest_status_sequence;
+    std::cout << "[StreamMotion] Synced legacy sequence counters from command-position preamble. seq="
+              << *latest_status_sequence << std::endl;
   }
   return true;
 }

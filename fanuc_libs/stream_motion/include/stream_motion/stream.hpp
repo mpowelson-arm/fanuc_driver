@@ -106,8 +106,8 @@ public:
   void configureForceSensor(uint32_t do_reset, uint32_t force_sensor_type) const override;
 
 private:
-  uint32_t status_sequence_no_ = 0;
-  uint32_t command_sequence_no_ = 0;
+  mutable uint32_t status_sequence_no_ = 0;
+  mutable uint32_t command_sequence_no_ = 0;
 
   uint32_t version_no_ = kVersion;  // stream motion available version from ControllerCapabilityResultPacket
 
@@ -126,6 +126,8 @@ void swapGPIOConfigPacketBytes(GPIOConfigPacket& gpio_config_packet);
 void swapControllerCapabilityBytes(ControllerCapabilityPacket& controller_capability_packet);
 
 void swapControllerCapabilityResponseBytes(ControllerCapabilityResultPacket& controller_capability_result_packet);
+
+void swapCommandPositionResponseBytes(CommandPositionResponsePacket& command_position_response);
 
 void ValidateGPIOConfig(const GPIOConfiguration& gpio_config);
 
