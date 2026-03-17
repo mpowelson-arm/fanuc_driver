@@ -584,6 +584,11 @@ hardware_interface::return_type FanucHardwareInterface::write(const rclcpp::Time
   try
   {
     joint_targets_degrees_.array() = 180.0 / M_PI * joint_targets_.array();
+    // Keep any unexposed external axes at their current measured positions.
+    for (Eigen::Index i = static_cast<Eigen::Index>(info_.joints.size()); i < joint_targets_degrees_.size(); ++i)
+    {
+      joint_targets_degrees_[i] = 180.0 / M_PI * fr_joint_pos_[i];
+    }
     fanuc_client_->writeJointTarget(joint_targets_degrees_);
 
     for (const auto& io_command : io_commands_)

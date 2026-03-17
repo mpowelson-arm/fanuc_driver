@@ -136,6 +136,29 @@ struct StreamMotionConnection::PSocketImpl
     std::cout << "Created UDP socket at: " << sock.address() << std::endl;
   }
 
+  bool sendStopPacketForVersion(uint32_t version)
+  {
+    StopPacket stop_packet{};
+    stop_packet.packet_type = swapBytesIfNeeded(stop_packet.packet_type);
+    stop_packet.version_no = swapBytesIfNeeded(version);
+    return send(stop_packet);
+  }
+
+  void drainSocket(std::chrono::milliseconds quiet_period)
+  {
+    std::array<uint8_t, 512> buffer{};
+    const auto deadline = std::chrono::steady_clock::now() + quiet_period;
+    while (std::chrono::steady_clock::now() < deadline)
+    {
+      auto res = sock.recv(buffer.data(), buffer.size());
+      if (res && res.value() > 0)
+      {
+        continue;
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+  }
+
   template <typename T>
   bool send(const T& value)
   {
@@ -154,16 +177,18 @@ struct StreamMotionConnection::PSocketImpl
   bool receive(T& value)
   {
     value = T();
+    std::array<uint8_t, 512> raw_bytes{};
     const auto start_time = std::chrono::steady_clock::now();
     uint32_t discard_count = 0;
     while (true)
     {
       constexpr size_t kPacketNumBytes = sizeof(T);
-      sockpp::result<size_t> res = sock.recv(&value, kPacketNumBytes);
+      sockpp::result<size_t> res = sock.recv(raw_bytes.data(), raw_bytes.size());
       const bool has_value = static_cast<bool>(res);
       const size_t received_size = has_value ? res.value() : 0;
-      if (res == kPacketNumBytes)
+      if (received_size == kPacketNumBytes)
       {
+        std::memcpy(&value, raw_bytes.data(), kPacketNumBytes);
         return true;
       }
       if (has_value && received_size > 0)
@@ -172,7 +197,7 @@ struct StreamMotionConnection::PSocketImpl
         {
           std::cerr << "Discarding unexpected UDP packet while waiting for " << kPacketNumBytes
                     << "-byte response. got=" << received_size << " from " << server_address
-                    << " raw=" << FormatByteString(&value, received_size) << std::endl;
+                    << " raw=" << FormatByteString(raw_bytes.data(), received_size) << std::endl;
         }
         continue;
       }
@@ -332,6 +357,14 @@ bool StreamMotionConnection::configureGPIO(const GPIOConfiguration& config) cons
 
 bool StreamMotionConnection::getControllerCapability(ControllerCapabilityResultPacket& controller_capability)
 {
+  // A previously interrupted session can leave the controller sending legacy
+  // status packets to the next source port that talks to Stream Motion.
+  // Send a few stop packets and drain any queued datagrams before negotiating capability.
+  socket_impl_->sendStopPacketForVersion(1);
+  socket_impl_->sendStopPacketForVersion(2);
+  socket_impl_->sendStopPacketForVersion(3);
+  socket_impl_->drainSocket(std::chrono::milliseconds(50));
+
   ControllerCapabilityPacket controller_capability_packet{};
   controller_capability_packet.packet_type = kGetCapabilityPacketType;
   controller_capability_packet.version_no = version_no_;

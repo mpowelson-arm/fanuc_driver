@@ -589,7 +589,12 @@ void FanucClient::startRealtimeStream(std::shared_ptr<GPIOBuffer> gpio_buffer)
   {
     rt_thread_.join();
   }
-  rt_thread_ = std::thread([this] { streamMotionThread(last_joint_angles_); });
+  Eigen::VectorXd initial_stream_command = Eigen::VectorXd::Zero(status.joint_angle.size());
+  for (Eigen::Index i = 0; i < status.joint_angle.size(); ++i)
+  {
+    initial_stream_command[i] = command_pos[i];
+  }
+  rt_thread_ = std::thread([this, initial_stream_command] { streamMotionThread(initial_stream_command); });
 }
 
 void FanucClient::stopRealtimeStream()
