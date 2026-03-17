@@ -5,7 +5,11 @@
 
 #include "stream_motion/stream.hpp"
 
+#include <algorithm>
 #include <cmath>
+#include <cstring>
+#include <iomanip>
+#include <sstream>
 #include <stdexcept>
 #include <thread>
 #include <unordered_map>
@@ -22,6 +26,28 @@ namespace
 {
 constexpr uint16_t kCommandPacketUnused = 0xFFFF;
 constexpr int kThresholdPayloadLength = 20;
+constexpr size_t kR50ControllerCapabilityResponseSize = 25;
+
+std::string FormatByteString(const void* data, const size_t size, const size_t max_bytes = 32)
+{
+  const auto* bytes = static_cast<const uint8_t*>(data);
+  std::ostringstream stream;
+  stream << std::hex << std::setfill('0');
+  const size_t bytes_to_print = std::min(size, max_bytes);
+  for (size_t i = 0; i < bytes_to_print; ++i)
+  {
+    if (i > 0)
+    {
+      stream << ' ';
+    }
+    stream << std::setw(2) << static_cast<unsigned>(bytes[i]);
+  }
+  if (size > max_bytes)
+  {
+    stream << " ...";
+  }
+  return stream.str();
+}
 
 bool IsReadGPIOConfig(const GPIOControlConfig& config)
 {
@@ -121,29 +147,75 @@ struct StreamMotionConnection::PSocketImpl
   template <typename T>
   bool receive(T& value)
   {
-    // Clear the status packet before receiving new data
     value = T();
-
-    void* buf = &value;
     const auto start_time = std::chrono::steady_clock::now();
     while (true)
     {
       constexpr size_t kPacketNumBytes = sizeof(T);
-      sockpp::result<size_t> res = sock.recv(buf, kPacketNumBytes);
-      if (res != kPacketNumBytes &&
-          std::chrono::steady_clock::now() - start_time > std::chrono::duration<double>(timeout))
-      {
-        std::cerr << "Timeout while reading from UDP socket." << std::endl;
-        return false;
-      }
+      sockpp::result<size_t> res = sock.recv(&value, kPacketNumBytes);
+      const bool has_value = static_cast<bool>(res);
+      const size_t received_size = has_value ? res.value() : 0;
       if (res == kPacketNumBytes)
       {
-        break;
+        return true;
+      }
+      if (has_value && received_size > 0)
+      {
+        std::cerr << "Received unexpected UDP packet size. Expected " << kPacketNumBytes << " bytes, got "
+                  << received_size << " bytes from " << server_address
+                  << ". Raw bytes: " << FormatByteString(&value, received_size)
+                  << std::endl;
+        return false;
+      }
+      if (std::chrono::steady_clock::now() - start_time > std::chrono::duration<double>(timeout))
+      {
+        std::cerr << "Timeout while reading from UDP socket. Expected " << kPacketNumBytes << " bytes from "
+                  << server_address << ". Last socket error: " << res.error_message() << std::endl;
+        return false;
       }
       std::this_thread::sleep_for(std::chrono::microseconds(100));
     }
+  }
 
-    return true;
+  bool receiveControllerCapability(ControllerCapabilityResultPacket& controller_capability)
+  {
+    controller_capability = ControllerCapabilityResultPacket{};
+    std::array<uint8_t, sizeof(ControllerCapabilityResultPacket)> raw_bytes{};
+    const auto start_time = std::chrono::steady_clock::now();
+    while (true)
+    {
+      sockpp::result<size_t> res = sock.recv(raw_bytes.data(), raw_bytes.size());
+      const bool has_value = static_cast<bool>(res);
+      const size_t received_size = has_value ? res.value() : 0;
+      if (received_size == sizeof(ControllerCapabilityResultPacket) || received_size == kR50ControllerCapabilityResponseSize)
+      {
+        std::memcpy(&controller_capability, raw_bytes.data(), received_size);
+        if (received_size == kR50ControllerCapabilityResponseSize)
+        {
+          controller_capability.rob_status_use_tcp = raw_bytes[24];
+          std::cerr << "Received 25-byte controller capability response from " << server_address
+                    << ". Accepting it using R-50 compatibility parsing. Raw bytes: "
+                    << FormatByteString(raw_bytes.data(), received_size) << std::endl;
+        }
+        return true;
+      }
+      if (has_value && received_size > 0)
+      {
+        std::cerr << "Received unexpected controller capability size. Expected "
+                  << sizeof(ControllerCapabilityResultPacket) << " or " << kR50ControllerCapabilityResponseSize
+                  << " bytes, got " << received_size << " bytes from " << server_address
+                  << ". Raw bytes: " << FormatByteString(raw_bytes.data(), received_size) << std::endl;
+        return false;
+      }
+      if (std::chrono::steady_clock::now() - start_time > std::chrono::duration<double>(timeout))
+      {
+        std::cerr << "Timeout while reading controller capability from UDP socket. Expected "
+                  << sizeof(ControllerCapabilityResultPacket) << " or " << kR50ControllerCapabilityResponseSize
+                  << " bytes from " << server_address << ". Last socket error: " << res.error_message() << std::endl;
+        return false;
+      }
+      std::this_thread::sleep_for(std::chrono::microseconds(100));
+    }
   }
 
   sockpp::udp_socket sock;
@@ -176,6 +248,7 @@ bool StreamMotionConnection::getRobotLimits(const uint32_t axis_number, RobotThr
   socket_impl_->send(threshold_packet);
   if (!socket_impl_->receive(robot_threshold_velocity))
   {
+    std::cerr << "Failed to receive velocity threshold response for axis " << axis_number << '.' << std::endl;
     return false;
   }
   swapRobotThresholdPacketBytes(robot_threshold_velocity);
@@ -184,6 +257,7 @@ bool StreamMotionConnection::getRobotLimits(const uint32_t axis_number, RobotThr
   socket_impl_->send(threshold_packet);
   if (!socket_impl_->receive(robot_threshold_acceleration))
   {
+    std::cerr << "Failed to receive acceleration threshold response for axis " << axis_number << '.' << std::endl;
     return false;
   }
   swapRobotThresholdPacketBytes(robot_threshold_acceleration);
@@ -192,6 +266,7 @@ bool StreamMotionConnection::getRobotLimits(const uint32_t axis_number, RobotThr
   socket_impl_->send(threshold_packet);
   if (!socket_impl_->receive(robot_threshold_jerk))
   {
+    std::cerr << "Failed to receive jerk threshold response for axis " << axis_number << '.' << std::endl;
     return false;
   }
   swapRobotThresholdPacketBytes(robot_threshold_jerk);
@@ -235,12 +310,21 @@ bool StreamMotionConnection::getControllerCapability(ControllerCapabilityResultP
   swapControllerCapabilityBytes(controller_capability_packet);
   socket_impl_->send(controller_capability_packet);
   controller_capability = ControllerCapabilityResultPacket{};
-  if (!socket_impl_->receive(controller_capability))
+  if (!socket_impl_->receiveControllerCapability(controller_capability))
   {
     std::cerr << "Failed to get response for controller capability." << std::endl;
     return false;
   }
   swapControllerCapabilityResponseBytes(controller_capability);
+  if (controller_capability.packet_type != kGetCapabilityPacketType)
+  {
+    std::cerr << "Unexpected controller capability packet type: " << controller_capability.packet_type
+              << " (expected " << kGetCapabilityPacketType << ")." << std::endl;
+  }
+  std::cout << "Controller capability response: sampling_rate=" << controller_capability.sampling_rate
+            << "ms, start_move=" << controller_capability.start_move
+            << ", available_version=" << controller_capability.available_version
+            << ", rob_status_use_tcp=" << controller_capability.rob_status_use_tcp << std::endl;
   version_no_ = controller_capability.available_version;
 
   return true;
@@ -422,7 +506,8 @@ bool StreamMotionConnection::getStatusPacket(RobotStatusPacket& status)
 
     if (!received)
     {
-      std::cerr << "Fail to get status packet." << std::endl;
+      std::cerr << "Fail to get status packet. command_sequence_no=" << command_sequence_no_
+                << " status_sequence_no=" << status_sequence_no_ << " version_no=" << version_no_ << std::endl;
       return false;
     }
 
@@ -430,6 +515,9 @@ bool StreamMotionConnection::getStatusPacket(RobotStatusPacket& status)
 
     // Swap the bits of the received status packet
     swapRobotStatusPacketBytes(status);
+    std::cout << "Received status packet: packet_type=" << status.packet_type << " version_no=" << status.version_no
+              << " sequence_no=" << status.sequence_no << " status=0x" << std::hex << static_cast<int>(status.status)
+              << " robot_status=0x" << static_cast<int>(status.robot_status) << std::dec << std::endl;
 
     if (status_sequence_no_ != status.sequence_no)
     {

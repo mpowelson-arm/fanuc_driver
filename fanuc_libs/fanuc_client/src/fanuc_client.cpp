@@ -98,9 +98,15 @@ FanucClient::FanucClient(std::string robot_ip, const uint16_t stream_motion_port
 {
   rmi_connection_->connect(5);
   stream_motion::ControllerCapabilityResultPacket controller_capability;
-  stream_motion_->getControllerCapability(controller_capability);
+  if (!stream_motion_->getControllerCapability(controller_capability))
+  {
+    throw std::runtime_error("Failed to negotiate Stream Motion controller capability.");
+  }
   control_period_ = controller_capability.sampling_rate;
   client_version_ = controller_capability.available_version;
+  std::cout << "Using Stream Motion settings from controller capability: sampling_rate=" << control_period_
+            << "ms, available_version=" << client_version_ << ", start_move=" << controller_capability.start_move
+            << ", rob_status_use_tcp=" << controller_capability.rob_status_use_tcp << std::endl;
   fetchRobotLimits();
 
   setupSignalHandler();
@@ -464,6 +470,9 @@ void FanucClient::startRMI()
 void FanucClient::startRealtimeStream(std::shared_ptr<GPIOBuffer> gpio_buffer)
 {
   AssertNotStreaming(is_streaming_);
+  constexpr auto kStreamStartupTimeout = std::chrono::seconds(10);
+  constexpr auto kStartPacketRetryInterval = std::chrono::milliseconds(200);
+  constexpr auto kRMIStatusPollInterval = std::chrono::milliseconds(500);
 
   stream_motion_->sendStopPacket();
 
@@ -474,14 +483,21 @@ void FanucClient::startRealtimeStream(std::shared_ptr<GPIOBuffer> gpio_buffer)
   }
 
   startRMI();
-  rmi_connection_->programCallNonBlocking("STREAM_MOTN");
+  const auto stream_motn_request = rmi_connection_->programCallNonBlocking("STREAM_MOTN");
+  std::cout << "Requested RMI program call for STREAM_MOTN with sequence_id=" << stream_motn_request.SequenceID
+            << std::endl;
 
   // Wait for the stream connection to be ready
   stream_motion::RobotStatusPacket status;
   stream_motion_->sendStartPacket();
+  std::cout << "Sent Stream Motion start packet." << std::endl;
   stream_motion_->configureForceSensor(0, force_sensor_type_);
+  std::cout << "Configured force sensor. force_sensor_type=" << force_sensor_type_ << std::endl;
   const auto pre_loop_time = std::chrono::steady_clock::now();
+  auto last_start_packet_time = pre_loop_time;
+  auto last_rmi_status_poll_time = pre_loop_time;
   bool got_status = false;
+  int start_packet_attempts = 1;
   while (true)
   {
     if (stream_motion_->getStatusPacket(status))
@@ -493,14 +509,53 @@ void FanucClient::startRealtimeStream(std::shared_ptr<GPIOBuffer> gpio_buffer)
         break;
       }
     }
-    if (std::chrono::steady_clock::now() - pre_loop_time > std::chrono::seconds(2))
+
+    const auto now = std::chrono::steady_clock::now();
+    if (!got_status && now - last_start_packet_time >= kStartPacketRetryInterval)
+    {
+      stream_motion_->sendStartPacket();
+      ++start_packet_attempts;
+      last_start_packet_time = now;
+      std::cout << "Resent Stream Motion start packet. attempt=" << start_packet_attempts << std::endl;
+    }
+
+    if (now - last_rmi_status_poll_time >= kRMIStatusPollInterval)
+    {
+      try
+      {
+        const auto rmi_status = rmi_connection_->getStatus(1.0);
+        std::cout << "RMI status while waiting for stream: ErrorID=" << rmi_status.ErrorID
+                  << " ServoReady=" << static_cast<int>(rmi_status.ServoReady)
+                  << " TPMode=" << static_cast<int>(rmi_status.TPMode)
+                  << " RMIMotionStatus=" << static_cast<int>(rmi_status.RMIMotionStatus)
+                  << " ProgramStatus=" << static_cast<int>(rmi_status.ProgramStatus)
+                  << " SingleStepMode=" << static_cast<int>(rmi_status.SingleStepMode)
+                  << " NumberUTool=" << static_cast<int>(rmi_status.NumberUTool)
+                  << " NumberUFrame=" << static_cast<int>(rmi_status.NumberUFrame)
+                  << " Override=" << static_cast<int>(rmi_status.Override)
+                  << " NextSequenceID=" << rmi_status.NextSequenceID << std::endl;
+      }
+      catch (const std::exception& e)
+      {
+        std::cerr << "Failed to poll RMI status while waiting for stream: " << e.what() << std::endl;
+      }
+      last_rmi_status_poll_time = now;
+    }
+
+    if (now - pre_loop_time > kStreamStartupTimeout)
     {
       if (got_status)
       {
+        std::cerr << "Timed out waiting for STREAM_MOTN ready bit. Last status packet: sequence_no="
+                  << status.sequence_no << " status=0x" << std::hex << static_cast<int>(status.status)
+                  << " robot_status=0x" << static_cast<int>(status.robot_status) << std::dec
+                  << " start_packet_attempts=" << start_packet_attempts << std::endl;
         throw std::runtime_error(kStatusStatusNotReadyMessage);
       }
       else
       {
+        std::cerr << "Timed out waiting for any Stream Motion status packet after launching STREAM_MOTN."
+                  << " start_packet_attempts=" << start_packet_attempts << std::endl;
         throw std::runtime_error(kStatusPacketFailureMessage);
       }
     }
