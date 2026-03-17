@@ -311,13 +311,13 @@ void printStatusSummary(const StatusPacketV1& packet)
 }
 
 void sendFloatHoldCommand(sockpp::udp_socket& socket, const uint32_t version, const uint32_t sequence_no,
-                          const StatusPacketV1& status)
+                          const StatusPacketV1& status, const bool last_data = false)
 {
   CommandPacketFloat command{};
   command.packet_type = toBigEndian<uint32_t>(1);
   command.version_no = toBigEndian(version);
   command.sequence_no = toBigEndian(sequence_no);
-  command.last_data = 0;
+  command.last_data = last_data ? 1 : 0;
   command.io_read_type = 0;
   command.io_read_index = toBigEndian<uint16_t>(0);
   command.io_read_mask = toBigEndian<uint16_t>(0);
@@ -337,17 +337,18 @@ void sendFloatHoldCommand(sockpp::udp_socket& socket, const uint32_t version, co
   {
     throw std::runtime_error("Failed to send float command packet: " + res.error_message());
   }
-  std::cout << "Sent float hold-position command with sequence " << sequence_no << std::endl;
+  std::cout << "Sent float hold-position command with sequence " << sequence_no
+            << " last_data=" << static_cast<int>(command.last_data) << std::endl;
 }
 
 void sendDoubleHoldCommand(sockpp::udp_socket& socket, const uint32_t version, const uint32_t sequence_no,
-                           const StatusPacketV1& status)
+                           const StatusPacketV1& status, const bool last_data = false)
 {
   CommandPacketDouble command{};
   command.packet_type = toBigEndian<uint32_t>(5);
   command.version_no = toBigEndian(version);
   command.sequence_no = toBigEndian(sequence_no);
-  command.last_data = 0;
+  command.last_data = last_data ? 1 : 0;
   command.io_read_type = 0;
   command.io_read_index = toBigEndian<uint16_t>(0);
   command.io_read_mask = toBigEndian<uint16_t>(0);
@@ -368,7 +369,25 @@ void sendDoubleHoldCommand(sockpp::udp_socket& socket, const uint32_t version, c
   {
     throw std::runtime_error("Failed to send double command packet: " + res.error_message());
   }
-  std::cout << "Sent double hold-position command with sequence " << sequence_no << std::endl;
+  std::cout << "Sent double hold-position command with sequence " << sequence_no
+            << " last_data=" << static_cast<int>(command.last_data) << std::endl;
+}
+
+void sendHoldCommand(sockpp::udp_socket& socket, const uint32_t version, const uint32_t sequence_no,
+                     const StatusPacketV1& status, const std::string& command_mode, const bool last_data = false)
+{
+  if (command_mode == "double")
+  {
+    sendDoubleHoldCommand(socket, version, sequence_no, status, last_data);
+  }
+  else if (command_mode == "float")
+  {
+    sendFloatHoldCommand(socket, version, sequence_no, status, last_data);
+  }
+  else
+  {
+    throw std::invalid_argument("Unsupported command mode: " + command_mode);
+  }
 }
 
 bool runStatusProbe(sockpp::udp_socket& socket, const ProbeOptions& options, const uint32_t start_version)
@@ -382,8 +401,10 @@ bool runStatusProbe(sockpp::udp_socket& socket, const ProbeOptions& options, con
 
   std::cout << "Sent status-start packet with version " << start_version << std::endl;
 
-  bool sent_command = false;
+  bool started_command_stream = false;
   bool got_status = false;
+  std::string command_mode = options.command_mode_override.value_or(start_version >= 2 ? "double" : "float");
+  std::optional<StatusPacketV1> last_status;
 
   for (int i = 0; i < options.status_count; ++i)
   {
@@ -416,25 +437,20 @@ bool runStatusProbe(sockpp::udp_socket& socket, const ProbeOptions& options, con
     StatusPacketV1 status{};
     std::memcpy(&status, buffer.data(), sizeof(status));
     printStatusSummary(status);
+    last_status = status;
 
-    if (options.send_hold_command && !sent_command && (status.status & 0x1) != 0)
+    if (options.send_hold_command && (status.status & 0x1) != 0)
     {
       const uint32_t command_sequence = fromBigEndian(status.sequence_no);
-      std::string command_mode = options.command_mode_override.value_or(start_version >= 2 ? "double" : "float");
-      if (command_mode == "double")
-      {
-        sendDoubleHoldCommand(socket, start_version, command_sequence, status);
-      }
-      else if (command_mode == "float")
-      {
-        sendFloatHoldCommand(socket, start_version, command_sequence, status);
-      }
-      else
-      {
-        throw std::invalid_argument("Unsupported command mode: " + command_mode);
-      }
-      sent_command = true;
+      sendHoldCommand(socket, start_version, command_sequence, status, command_mode, false);
+      started_command_stream = true;
     }
+  }
+
+  if (options.send_hold_command && started_command_stream && last_status.has_value())
+  {
+    const uint32_t final_sequence = fromBigEndian(last_status->sequence_no);
+    sendHoldCommand(socket, start_version, final_sequence, *last_status, command_mode, true);
   }
 
   StatusStopPacket stop_packet{ toBigEndian<uint32_t>(2), toBigEndian(start_version) };
