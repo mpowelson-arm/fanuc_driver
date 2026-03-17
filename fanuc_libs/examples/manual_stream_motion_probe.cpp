@@ -341,6 +341,53 @@ void bootstrapStreamMotionViaRMI(const ProbeOptions& options)
   std::cout << "Requested RMI program call for STREAM_MOTN with sequence_id=" << program_call.SequenceID << std::endl;
 }
 
+void dumpRMIState(const ProbeOptions& options, const std::string& reason)
+{
+  try
+  {
+    rmi::RMIConnection rmi_connection(options.robot_ip);
+    rmi_connection.connect(5.0);
+    const auto status = rmi_connection.getStatus(5.0);
+    std::cout << "RMI status after " << reason << ":"
+              << " ErrorID=" << status.ErrorID
+              << " ServoReady=" << static_cast<int>(status.ServoReady)
+              << " TPMode=" << static_cast<int>(status.TPMode)
+              << " RMIMotionStatus=" << static_cast<int>(status.RMIMotionStatus)
+              << " ProgramStatus=" << static_cast<int>(status.ProgramStatus)
+              << " SingleStepMode=" << static_cast<int>(status.SingleStepMode)
+              << " NumberUTool=" << static_cast<int>(status.NumberUTool)
+              << " NumberUFrame=" << static_cast<int>(status.NumberUFrame)
+              << " Override=" << static_cast<int>(status.Override)
+              << " NextSequenceID=" << status.NextSequenceID << std::endl;
+
+    const auto error = rmi_connection.readError(5.0);
+    std::cout << "RMI readError after " << reason << ":"
+              << " ErrorID=" << error.ErrorID
+              << " ErrorData=" << error.ErrorData;
+    if (error.ErrorData2.has_value())
+    {
+      std::cout << " ErrorData2=" << *error.ErrorData2;
+    }
+    if (error.ErrorData3.has_value())
+    {
+      std::cout << " ErrorData3=" << *error.ErrorData3;
+    }
+    if (error.ErrorData4.has_value())
+    {
+      std::cout << " ErrorData4=" << *error.ErrorData4;
+    }
+    if (error.ErrorData5.has_value())
+    {
+      std::cout << " ErrorData5=" << *error.ErrorData5;
+    }
+    std::cout << std::endl;
+  }
+  catch (const std::exception& e)
+  {
+    std::cout << "Failed to query RMI state after " << reason << ": " << e.what() << std::endl;
+  }
+}
+
 bool receivePacket(sockpp::udp_socket& socket, std::vector<uint8_t>& buffer, const int timeout_ms)
 {
   buffer.assign(kMaxPacketBytes, 0);
@@ -544,23 +591,24 @@ bool runStatusProbe(sockpp::udp_socket& socket, const ProbeOptions& options, con
     throw std::runtime_error("Failed to send status-start packet: " + send_res.error_message());
   }
 
-  std::cout << "Sent status-start packet with version " << start_version << std::endl;
-
   bool started_command_stream = false;
   bool got_status = false;
   std::optional<StatusPacketV1> last_status;
   std::optional<std::array<float, 9>> initial_joints;
   std::optional<uint32_t> initial_timestamp_ms;
   std::mutex command_mutex;
+  std::condition_variable command_cv;
   bool receiver_finished = false;
   bool have_command_state = false;
+  bool command_state_updated = false;
   uint32_t next_command_sequence = 0;
   int latest_packet_index = 0;
   StatusPacketV1 latest_status_for_command{};
   const uint32_t session_version = start_version;
-  const std::string session_command_mode =
-    options.command_mode_override.value_or(session_version >= 2 ? "double" : "float");
-  uint32_t send_period_us = 2000;
+  const std::string session_command_mode = options.command_mode_override.value_or("float");
+
+  std::cout << "Sent status-start packet with version " << start_version << std::endl;
+  std::cout << "Using command mode " << session_command_mode << " for this session." << std::endl;
 
   if (const auto command_position = requestCommandPosition(socket, options.timeout_ms))
   {
@@ -581,67 +629,45 @@ bool runStatusProbe(sockpp::udp_socket& socket, const ProbeOptions& options, con
   }
 
   std::thread sender_thread([&]() {
-    auto next_send_time = std::chrono::steady_clock::now();
-    bool has_sent_command = false;
     while (true)
     {
       std::array<float, 9> command_joints{};
       uint32_t command_sequence = 0;
       int packet_index = 0;
-      bool should_send = false;
       StatusPacketV1 status_for_command{};
       uint32_t version_to_use = session_version;
       std::string command_mode_to_use;
-      uint32_t send_period_local_us = 2000;
 
       {
-        std::lock_guard lock(command_mutex);
-        if (have_command_state && !receiver_finished)
+        std::unique_lock lock(command_mutex);
+        command_cv.wait(lock, [&]() { return receiver_finished || command_state_updated; });
+        if (receiver_finished && !command_state_updated)
+        {
+          break;
+        }
+        if (have_command_state)
         {
           status_for_command = latest_status_for_command;
           command_sequence = next_command_sequence;
           packet_index = latest_packet_index;
-          should_send = true;
           version_to_use = session_version;
           command_mode_to_use = session_command_mode;
-          send_period_local_us = send_period_us;
+          command_state_updated = false;
           ++next_command_sequence;
         }
-        else if (receiver_finished)
+        else
         {
-          break;
+          command_state_updated = false;
+          continue;
         }
-      }
-
-      if (!should_send)
-      {
-        std::this_thread::sleep_for(std::chrono::microseconds(100));
-        continue;
-      }
-
-      const auto now = std::chrono::steady_clock::now();
-      if (!has_sent_command)
-      {
-        next_send_time = now;
-      }
-      else if (now < next_send_time)
-      {
-        std::this_thread::sleep_until(next_send_time);
-      }
-      else if (now - next_send_time > std::chrono::milliseconds(10))
-      {
-        next_send_time = now;
       }
 
       command_joints = getCommandJoints(status_for_command, options, initial_joints, *initial_timestamp_ms);
       sendCommand(socket, version_to_use, command_sequence, command_joints, options.joint_number, packet_index,
                   options.log_every, command_mode_to_use, false);
-      has_sent_command = true;
-      next_send_time += std::chrono::microseconds(send_period_local_us);
     }
   });
 
-  std::optional<uint32_t> previous_status_timestamp_ms;
   for (int i = 0; i < options.status_count; ++i)
   {
     std::vector<uint8_t> buffer;
@@ -679,16 +705,6 @@ bool runStatusProbe(sockpp::udp_socket& socket, const ProbeOptions& options, con
     {
       printStatusSummary(status, i);
     }
-    const uint32_t current_timestamp_ms = fromBigEndian(status.time_stamp);
-    if (previous_status_timestamp_ms.has_value())
-    {
-      const uint32_t delta_ms = current_timestamp_ms - *previous_status_timestamp_ms;
-      if (delta_ms > 0)
-      {
-        send_period_us = delta_ms * 1000;
-      }
-    }
-    previous_status_timestamp_ms = current_timestamp_ms;
     last_status = status;
     if (!initial_joints.has_value())
     {
@@ -718,7 +734,16 @@ bool runStatusProbe(sockpp::udp_socket& socket, const ProbeOptions& options, con
       }
       latest_status_for_command = status;
       latest_packet_index = i;
+      command_state_updated = true;
       started_command_stream = true;
+      command_cv.notify_one();
+    }
+    else if (started_command_stream && (status.status & 0x1) == 0)
+    {
+      std::cout << "Waiting bit dropped at status packet[" << i
+                << "]. Stream command phase ended before requested motion started." << std::endl;
+      dumpRMIState(options, "waiting bit drop");
+      break;
     }
   }
 
@@ -726,13 +751,14 @@ bool runStatusProbe(sockpp::udp_socket& socket, const ProbeOptions& options, con
     std::lock_guard lock(command_mutex);
     receiver_finished = true;
   }
+  command_cv.notify_one();
   if (sender_thread.joinable())
   {
     sender_thread.join();
   }
 
   if (options.send_hold_command && started_command_stream && last_status.has_value() && initial_joints.has_value() &&
-      initial_timestamp_ms.has_value())
+      initial_timestamp_ms.has_value() && ((*last_status).status & 0x1) != 0)
   {
     const auto command_joints = getCommandJoints(*last_status, options, initial_joints, *initial_timestamp_ms);
     sendCommand(socket, session_version, next_command_sequence, command_joints, options.joint_number, options.status_count,
