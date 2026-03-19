@@ -12,9 +12,8 @@ set(CMAKE_CXX_STANDARD 17)
 include(FetchContent)
 FetchContent_Declare(
     sockpp
-    GIT_REPOSITORY ${CMAKE_SOURCE_DIR}/dependencies/sockpp
-    GIT_TAG afdeacba9448c7a77194eed6ab8e1c0b1653c79a
-    PATCH_COMMAND bash ${CMAKE_SOURCE_DIR}/dependencies/apply_patch.bash ${CMAKE_SOURCE_DIR}/dependencies/sockpp.patch
+    SOURCE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/dependencies/sockpp
+    PATCH_COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/dependencies/apply_patch.bash ${CMAKE_CURRENT_SOURCE_DIR}/dependencies/sockpp.patch
 )
 set(SOCKPP_BUILD_SHARED OFF CACHE BOOL "Build sockpp as a shared library")
 set(SOCKPP_BUILD_STATIC ON CACHE BOOL "Build sockpp as a static library")
@@ -24,16 +23,14 @@ set_target_properties(sockpp-static PROPERTIES POSITION_INDEPENDENT_CODE ON)
 # Create readerwriterqueue target
 FetchContent_Declare(
     readerwriterqueue
-    GIT_REPOSITORY ${CMAKE_SOURCE_DIR}/dependencies/readerwriterqueue
-    GIT_TAG 211616e0554f93152ab3108b8d93fbc23174a9d9
-    PATCH_COMMAND bash ${CMAKE_SOURCE_DIR}/dependencies/apply_patch.bash ${CMAKE_SOURCE_DIR}/dependencies/readerwriterqueue.patch
+    SOURCE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/dependencies/readerwriterqueue
+    PATCH_COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/dependencies/apply_patch.bash ${CMAKE_CURRENT_SOURCE_DIR}/dependencies/readerwriterqueue.patch
 )
 FetchContent_MakeAvailable(readerwriterqueue)
 
 FetchContent_Declare(
   yaml-cpp
-  GIT_REPOSITORY ${CMAKE_SOURCE_DIR}/dependencies/yaml-cpp
-  GIT_TAG 2f86d13775d119edbb69af52e5f566fd65c6953b
+  SOURCE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/dependencies/yaml-cpp
 )
 FetchContent_MakeAvailable(yaml-cpp)
 set(YAML_BUILD_SHARED_LIBS OFF CACHE BOOL "Build yaml-cpp shared library")
@@ -42,9 +39,8 @@ set(YAML_CPP_INSTALL OFF CACHE BOOL "Enable generation of yaml-cpp install targe
 # Build the reflectcpp library
 FetchContent_Declare(
     reflect-cpp
-    GIT_REPOSITORY ${CMAKE_SOURCE_DIR}/dependencies/reflect-cpp
-    GIT_TAG 2a0fdeabe35bdab0e07e05d4f869ca88bd6d2b8c
-    PATCH_COMMAND bash ${CMAKE_SOURCE_DIR}/dependencies/apply_patch.bash ${CMAKE_SOURCE_DIR}/dependencies/reflectcpp.patch
+    SOURCE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/dependencies/reflect-cpp
+    PATCH_COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/dependencies/apply_patch.bash ${CMAKE_CURRENT_SOURCE_DIR}/dependencies/reflectcpp.patch
 )
 set(REFLECTCPP_BUILD_SHARED OFF CACHE BOOL "Build reflectcpp as a shared library")
 set(REFLECTCPP_YAML ON CACHE BOOL "Enable YAML support")
