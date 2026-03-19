@@ -6,6 +6,7 @@
 #include "stream_motion/stream.hpp"
 
 #include <cmath>
+#include <cstring>
 #include <stdexcept>
 #include <thread>
 #include <unordered_map>
@@ -104,6 +105,29 @@ struct StreamMotionConnection::PSocketImpl
     std::cout << "Created UDP socket at: " << sock.address() << std::endl;
   }
 
+  bool sendStopPacketForVersion(uint32_t version)
+  {
+    StopPacket stop_packet{};
+    stop_packet.packet_type = swapBytesIfNeeded(stop_packet.packet_type);
+    stop_packet.version_no = swapBytesIfNeeded(version);
+    return send(stop_packet);
+  }
+
+  void drainSocket(std::chrono::milliseconds quiet_period)
+  {
+    std::array<uint8_t, 512> buffer{};
+    const auto deadline = std::chrono::steady_clock::now() + quiet_period;
+    while (std::chrono::steady_clock::now() < deadline)
+    {
+      auto res = sock.recv(buffer.data(), buffer.size());
+      if (res && res.value() > 0)
+      {
+        continue;
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+  }
+
   template <typename T>
   bool send(const T& value)
   {
@@ -124,26 +148,24 @@ struct StreamMotionConnection::PSocketImpl
     // Clear the status packet before receiving new data
     value = T();
 
-    void* buf = &value;
+    std::array<uint8_t, 512> raw_bytes{};
     const auto start_time = std::chrono::steady_clock::now();
     while (true)
     {
       constexpr size_t kPacketNumBytes = sizeof(T);
-      sockpp::result<size_t> res = sock.recv(buf, kPacketNumBytes);
-      if (res != kPacketNumBytes &&
-          std::chrono::steady_clock::now() - start_time > std::chrono::duration<double>(timeout))
+      sockpp::result<size_t> res = sock.recv(raw_bytes.data(), raw_bytes.size());
+      if ((res == kPacketNumBytes))
+      {
+        std::memcpy(&value, raw_bytes.data(), kPacketNumBytes);
+        return true;
+      }
+      if (std::chrono::steady_clock::now() - start_time > std::chrono::duration<double>(timeout))
       {
         std::cerr << "Timeout while reading from UDP socket." << std::endl;
         return false;
       }
-      if (res == kPacketNumBytes)
-      {
-        break;
-      }
       std::this_thread::sleep_for(std::chrono::microseconds(100));
     }
-
-    return true;
   }
 
   sockpp::udp_socket sock;
@@ -229,6 +251,12 @@ bool StreamMotionConnection::configureGPIO(const GPIOConfiguration& config) cons
 
 bool StreamMotionConnection::getControllerCapability(ControllerCapabilityResultPacket& controller_capability)
 {
+  // Clear any stale Stream Motion session state before starting a new one.
+  socket_impl_->sendStopPacketForVersion(1);
+  socket_impl_->sendStopPacketForVersion(2);
+  socket_impl_->sendStopPacketForVersion(3);
+  socket_impl_->drainSocket(std::chrono::milliseconds(50));
+
   ControllerCapabilityPacket controller_capability_packet{};
   controller_capability_packet.packet_type = kGetCapabilityPacketType;
   controller_capability_packet.version_no = version_no_;
