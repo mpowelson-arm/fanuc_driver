@@ -238,7 +238,7 @@ struct StatusRequestPacket
     uint8_t ProgramStatus;
     uint8_t SingleStepMode;
     uint8_t NumberUTool;
-    int NextSequenceID;
+    int NextSequenceID = 0;
     uint8_t NumberUFrame;
     uint8_t Override;
   };

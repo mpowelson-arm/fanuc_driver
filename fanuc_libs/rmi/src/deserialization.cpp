@@ -5,6 +5,7 @@
 
 #include "rmi/serialization.hpp"
 
+#include "rfl/DefaultIfMissing.hpp"
 #include "rfl/json.hpp"
 #include "rmi/packets.hpp"
 
@@ -13,7 +14,13 @@ namespace rmi
 template <typename T>
 std::optional<T> FromJSON(const std::string& json)
 {
-  const auto result = rfl::json::read<T>(json);
+  const auto result = [&json]() {
+    if constexpr (std::is_same_v<T, StatusRequestPacket::Response>)
+    {
+      return rfl::json::read<T, rfl::DefaultIfMissing>(json);
+    }
+    return rfl::json::read<T>(json);
+  }();
   bool valid_result = false;
   if constexpr (requires(T t) { t.Command; })
   {
